@@ -1,0 +1,10 @@
+# Generated exports and imports can contain real tenant, safe, user, group, or permission data.
+*.csv
+
+# PowerShell/editor/local artifacts
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
