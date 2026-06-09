@@ -55,3 +55,17 @@ MoveAccountsAndFolders
 ```
 
 Boolean values can be `TRUE` or `FALSE`. `RequestsAuthorizationLevel` should be numeric.
+
+## PSM Users From Recordings Export
+
+The on-prem `Export PSM users from recordings CSV` option writes one row per
+unique vault user found in PSM recording metadata for the selected lookback
+window. The default lookback window is 90 days.
+
+```text
+UserName,SessionCount,FirstSession,LastSession,Protocols,Clients,Safes,RemoteMachines
+```
+
+`SessionCount` is the number of returned recordings for that user. The remaining
+fields are distinct values observed across that user's sessions, joined with
+semicolons where more than one value exists.

@@ -1,13 +1,14 @@
 # CyberArk API Runner
 
-PowerShell CLI for CyberArk Privilege Cloud safe member reporting and safe member imports.
+PowerShell CLI for CyberArk reporting and safe management.
 
-The app authenticates once, then lets you run safe management tasks from a menu.
+The app authenticates once, then lets you run CyberArk tasks from a menu. Privilege Cloud mode supports safe member reporting/imports. On-prem mode supports PVWA authentication and PSM usage reporting from recorded sessions.
 
 ## Requirements
 
 - PowerShell 7 or newer
-- A CyberArk Identity OAuth user or interactive user that can get a Privilege Cloud platform token
+- For Privilege Cloud: a CyberArk Identity OAuth user or interactive user that can get a Privilege Cloud platform token
+- For on-prem PAM: a PVWA URL and CyberArk, LDAP, or RADIUS user that can view PSM recordings
 
 On this Linux machine, PowerShell is available as `pwsh`.
 
@@ -21,6 +22,12 @@ On this Linux machine, PowerShell is available as `pwsh`.
 
 ```bash
 pwsh ./CyberArkApiRunner.ps1
+```
+
+To launch directly into on-prem mode:
+
+```bash
+pwsh ./CyberArkApiRunner.ps1 -EnvironmentType onprem -PVWAUrl https://pvwa.company.com/PasswordVault -OnPremAuthType cyberark -Username apiuser
 ```
 
 You can also pass values directly:
@@ -42,7 +49,8 @@ The script follows the same authentication pattern used by FastPAS:
 
 The app asks for the password or OAuth secret at runtime and does not save it.
 If you pass `-Token`, the script will still use that token directly as an
-override.
+override. Privilege Cloud tokens are sent as bearer tokens; on-prem PVWA session
+tokens are sent as the raw `Authorization` header value returned by PVWA.
 
 ## Menu Options
 
@@ -73,6 +81,36 @@ The export includes:
 - flattened safe permission columns from CyberArk
 
 Groups are sorted before users within each safe.
+
+### Export PSM Users From Recordings CSV
+
+On-prem mode calls:
+
+```text
+POST https://<pvwa>/PasswordVault/API/Auth/<CyberArk|LDAP|RADIUS>/Logon
+GET  https://<pvwa>/PasswordVault/API/Recordings?FromTime=<epoch>&ToTime=<epoch>&Limit=100&OffSet=<offset>
+```
+
+By default, the report looks back 90 days, which is roughly the past three months.
+You can change this when launching the script with `-PsmLookbackDays <days>`.
+
+The CSV is written to the directory where the script is run. The default file
+name includes a timestamp:
+
+```text
+psm_users_past_90_days_20260603_121500.csv
+```
+
+The export includes one row per PSM vault user:
+
+- `UserName`
+- `SessionCount`
+- `FirstSession`
+- `LastSession`
+- `Protocols`
+- `Clients`
+- `Safes`
+- `RemoteMachines`
 
 ### Add Safe Members And Groups From CSV
 

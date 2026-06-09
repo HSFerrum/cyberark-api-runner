@@ -37,7 +37,21 @@ param (
     [string]$CsvPath,
 
     [Parameter(Mandatory = $false)]
-    [string]$OutputFile
+    [string]$OutputFile,
+
+    [Parameter(Mandatory = $false)]
+    [ValidateSet("privilegecloud", "onprem")]
+    [string]$EnvironmentType,
+
+    [Parameter(Mandatory = $false)]
+    [string]$PVWAUrl,
+
+    [Parameter(Mandatory = $false)]
+    [ValidateSet("cyberark", "ldap", "radius")]
+    [string]$OnPremAuthType,
+
+    [Parameter(Mandatory = $false)]
+    [int]$PsmLookbackDays = 90
 )
 
 Set-StrictMode -Version Latest
@@ -118,6 +132,38 @@ function Format-AuthorizationToken {
         return $TrimmedToken
     }
     return "Bearer $TrimmedToken"
+}
+
+function Format-OnPremAuthorizationToken {
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$Token
+    )
+
+    $TrimmedToken = $Token.Trim()
+    if ($TrimmedToken -match "^(?i)Bearer\s+") {
+        return $TrimmedToken
+    }
+    return $TrimmedToken
+}
+
+function Resolve-PVWAUrl {
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$Url
+    )
+
+    $Resolved = $Url.Trim().TrimEnd("/")
+    if ([string]::IsNullOrWhiteSpace($Resolved)) {
+        throw "PVWA URL is required."
+    }
+    if ($Resolved -notmatch "^(?i)https?://") {
+        $Resolved = "https://$Resolved"
+    }
+    if ($Resolved -notmatch "(?i)/PasswordVault$") {
+        $Resolved = "$Resolved/PasswordVault"
+    }
+    return $Resolved
 }
 
 function Resolve-IdentityHost {
@@ -667,6 +713,64 @@ function Get-InteractivePlatformToken {
     return Format-AuthorizationToken -Token $Token
 }
 
+function Get-OnPremSessionToken {
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$PVWAUrl,
+
+        [Parameter(Mandatory = $false)]
+        [string]$ExistingToken
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($ExistingToken)) {
+        return Format-OnPremAuthorizationToken -Token $ExistingToken
+    }
+
+    if ([string]::IsNullOrWhiteSpace($script:OnPremAuthType)) {
+        $script:OnPremAuthType = Read-Choice -Prompt "On-prem authentication type" -Choices @("cyberark", "ldap", "radius")
+    }
+    if ([string]::IsNullOrWhiteSpace($script:Username)) {
+        $script:Username = Read-RequiredValue -Prompt "Vault username"
+    }
+
+    $Password = ConvertFrom-SecureStringToPlainText -SecureString (Read-Host "Vault password" -AsSecureString)
+    if ($script:OnPremAuthType -eq "radius") {
+        $Otp = Read-Host "RADIUS OTP (leave blank if appended by your password workflow)"
+        if (-not [string]::IsNullOrWhiteSpace($Otp)) {
+            $Password = "$Password,$($Otp.Trim())"
+        }
+    }
+
+    $AuthProvider = switch ($script:OnPremAuthType) {
+        "cyberark" { "CyberArk" }
+        "ldap" { "LDAP" }
+        "radius" { "RADIUS" }
+    }
+
+    $LogonUrl = "$PVWAUrl/API/Auth/$AuthProvider/Logon"
+    $Body = @{
+        username          = $script:Username
+        password          = $Password
+        concurrentSession = $true
+    }
+
+    Write-Host "Authenticating to on-prem PVWA..." -ForegroundColor Cyan
+    $Response = Invoke-JsonPost -Uri $LogonUrl -Body $Body
+    if ($Response -is [string] -and -not [string]::IsNullOrWhiteSpace($Response)) {
+        return Format-OnPremAuthorizationToken -Token $Response
+    }
+
+    $Token = Get-ResponseToken -Response $Response
+    if ([string]::IsNullOrWhiteSpace($Token) -and $Response.PSObject.Properties.Name -contains "CyberArkLogonResult") {
+        $Token = [string]$Response.CyberArkLogonResult
+    }
+    if ([string]::IsNullOrWhiteSpace($Token)) {
+        throw "On-prem logon response did not contain a session token."
+    }
+
+    return Format-OnPremAuthorizationToken -Token $Token
+}
+
 function Get-PlatformToken {
     param (
         [Parameter(Mandatory = $true)]
@@ -719,22 +823,35 @@ function Invoke-CyberArkGet {
         [string]$Uri,
 
         [Parameter(Mandatory = $true)]
-        [hashtable]$Headers
+        [hashtable]$Headers,
+
+        [Parameter(Mandatory = $false)]
+        [int]$MaxAttempts = 4
     )
 
-    try {
-        return Invoke-RestMethod -Uri $Uri -Method Get -Headers $Headers -TimeoutSec 120
-    }
-    catch {
-        $StatusCode = $null
-        if ($_.Exception.Response -and $_.Exception.Response.StatusCode) {
-            $StatusCode = [int]$_.Exception.Response.StatusCode
+    for ($Attempt = 1; $Attempt -le $MaxAttempts; $Attempt++) {
+        try {
+            return Invoke-RestMethod -Uri $Uri -Method Get -Headers $Headers -TimeoutSec 120
         }
+        catch {
+            $StatusCode = $null
+            if ($_.Exception.Response -and $_.Exception.Response.StatusCode) {
+                $StatusCode = [int]$_.Exception.Response.StatusCode
+            }
 
-        if ($StatusCode) {
-            throw "GET failed with HTTP $StatusCode from $Uri. $($_.Exception.Message)"
+            $IsTransient = $StatusCode -in @(408, 429, 500, 502, 503, 504)
+            if ($IsTransient -and $Attempt -lt $MaxAttempts) {
+                $DelaySeconds = [int][math]::Pow(2, $Attempt)
+                Write-Warning "GET returned HTTP $StatusCode. Retrying in $DelaySeconds seconds (attempt $($Attempt + 1) of $MaxAttempts)..."
+                Start-Sleep -Seconds $DelaySeconds
+                continue
+            }
+
+            if ($StatusCode) {
+                throw "GET failed with HTTP $StatusCode from $Uri after $Attempt attempt(s). $($_.Exception.Message)"
+            }
+            throw "GET failed from $Uri after $Attempt attempt(s). $($_.Exception.Message)"
         }
-        throw "GET failed from $Uri. $($_.Exception.Message)"
     }
 }
 
@@ -794,7 +911,7 @@ function Get-PagedVaultItems {
         [hashtable]$Headers,
 
         [Parameter(Mandatory = $false)]
-        [int]$Limit = 1000
+        [int]$Limit = 100
     )
 
     $Items = @()
@@ -1049,6 +1166,242 @@ function Add-SafeMemberFromCsvRow {
     $null = Invoke-CyberArkJsonRequest -Method "POST" -Uri $Uri -Headers $Headers -Body $Body
 }
 
+function ConvertTo-UnixSeconds {
+    param (
+        [Parameter(Mandatory = $true)]
+        [datetime]$DateTime
+    )
+
+    return [int64]([datetimeoffset]$DateTime.ToUniversalTime()).ToUnixTimeSeconds()
+}
+
+function ConvertFrom-CyberArkEpoch {
+    param (
+        [Parameter(Mandatory = $false)]
+        [object]$Value
+    )
+
+    if ($null -eq $Value -or [string]::IsNullOrWhiteSpace([string]$Value)) {
+        return $null
+    }
+
+    $Epoch = [int64]0
+    if (-not [int64]::TryParse(([string]$Value).Trim(), [ref]$Epoch)) {
+        $Parsed = [datetime]::MinValue
+        if ([datetime]::TryParse(([string]$Value).Trim(), [ref]$Parsed)) {
+            return $Parsed
+        }
+        return $null
+    }
+
+    if (([string][math]::Abs($Epoch)).Length -gt 10) {
+        return [datetimeoffset]::FromUnixTimeMilliseconds($Epoch).LocalDateTime
+    }
+    return [datetimeoffset]::FromUnixTimeSeconds($Epoch).LocalDateTime
+}
+
+function Get-ObjectStringValue {
+    param (
+        [Parameter(Mandatory = $true)]
+        [object]$Item,
+
+        [Parameter(Mandatory = $true)]
+        [string[]]$Names
+    )
+
+    foreach ($Name in $Names) {
+        if ($Item.PSObject.Properties.Name -contains $Name -and $null -ne $Item.$Name) {
+            $Value = [string]$Item.$Name
+            if (-not [string]::IsNullOrWhiteSpace($Value)) {
+                return $Value.Trim()
+            }
+        }
+    }
+    return ""
+}
+
+function New-QueryString {
+    param (
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Parameters
+    )
+
+    $Parts = @()
+    foreach ($Key in $Parameters.Keys) {
+        if ($null -eq $Parameters[$Key] -or [string]::IsNullOrWhiteSpace([string]$Parameters[$Key])) {
+            continue
+        }
+        $Parts += "$([uri]::EscapeDataString($Key))=$([uri]::EscapeDataString([string]$Parameters[$Key]))"
+    }
+    return ($Parts -join "&")
+}
+
+function Get-PagedPsmRecordings {
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$PVWAUrl,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Headers,
+
+        [Parameter(Mandatory = $true)]
+        [datetime]$FromTime,
+
+        [Parameter(Mandatory = $true)]
+        [datetime]$ToTime,
+
+        [Parameter(Mandatory = $false)]
+        [int]$Limit = 100
+    )
+
+    $Recordings = @()
+    $Offset = 0
+    $Total = $null
+    $FromEpoch = ConvertTo-UnixSeconds -DateTime $FromTime
+    $ToEpoch = ConvertTo-UnixSeconds -DateTime $ToTime
+
+    while ($true) {
+        $Query = New-QueryString -Parameters @{
+            FromTime = $FromEpoch
+            ToTime   = $ToEpoch
+            Limit    = $Limit
+            OffSet   = $Offset
+        }
+        $Uri = "$PVWAUrl/API/Recordings?$Query"
+        $Response = Invoke-CyberArkGet -Uri $Uri -Headers $Headers
+
+        $Page = @()
+        if ($Response.PSObject.Properties.Name -contains "Recordings" -and $null -ne $Response.Recordings) {
+            $Page = @($Response.Recordings)
+        }
+        elseif ($Response.PSObject.Properties.Name -contains "value" -and $null -ne $Response.value) {
+            $Page = @($Response.value)
+        }
+        elseif ($Response -is [array]) {
+            $Page = @($Response)
+        }
+
+        if ($null -eq $Total -and $Response.PSObject.Properties.Name -contains "Total" -and $null -ne $Response.Total) {
+            $Total = [int]$Response.Total
+        }
+
+        if ($Page.Count -eq 0) {
+            break
+        }
+
+        $Recordings += $Page
+        $Offset += $Limit
+
+        if ($null -ne $Total) {
+            if ($Offset -ge $Total) {
+                break
+            }
+        }
+        elseif ($Page.Count -lt $Limit) {
+            break
+        }
+    }
+
+    return $Recordings
+}
+
+function Export-PsmUsersFromRecordings {
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$PVWAUrl,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Token,
+
+        [Parameter(Mandatory = $true)]
+        [string]$OutputFile,
+
+        [Parameter(Mandatory = $false)]
+        [int]$LookbackDays = 90
+    )
+
+    if ($LookbackDays -le 0) {
+        throw "Lookback days must be greater than zero."
+    }
+
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    $Headers = @{
+        "Authorization" = $Token
+        "Content-Type"  = "application/json"
+    }
+
+    $ToTime = Get-Date
+    $FromTime = $ToTime.AddDays(-1 * $LookbackDays)
+
+    Write-Host "Fetching PSM recordings from $($FromTime.ToString('s')) through $($ToTime.ToString('s'))..." -ForegroundColor Cyan
+    $Recordings = @(Get-PagedPsmRecordings -PVWAUrl $PVWAUrl -Headers $Headers -FromTime $FromTime -ToTime $ToTime)
+
+    if ($Recordings.Count -eq 0) {
+        Write-Warning "No PSM recordings were found for the selected time window, or the account does not have permission to view recordings."
+        return
+    }
+
+    Write-Host "Found $($Recordings.Count) recordings. Summarizing unique PSM users..." -ForegroundColor Green
+
+    $Grouped = $Recordings | Group-Object -Property {
+        $User = Get-ObjectStringValue -Item $_ -Names @("PSMVaultUserName", "UserName", "VaultUserName", "Username")
+        if ([string]::IsNullOrWhiteSpace($User)) {
+            return "<unknown>"
+        }
+        return $User
+    }
+
+    $ExportData = @()
+    foreach ($Group in $Grouped) {
+        if ($Group.Name -eq "<unknown>") {
+            continue
+        }
+
+        $StartTimes = @()
+        foreach ($Recording in $Group.Group) {
+            $StartValue = Get-ObjectStringValue -Item $Recording -Names @("PSMStartTime", "StartTime", "Start", "CreationDate")
+            $StartTime = ConvertFrom-CyberArkEpoch -Value $StartValue
+            if ($null -ne $StartTime) {
+                $StartTimes += $StartTime
+            }
+        }
+
+        $FirstSession = ""
+        $LastSession = ""
+        if ($StartTimes.Count -gt 0) {
+            $FirstSession = ($StartTimes | Sort-Object | Select-Object -First 1).ToString("s")
+            $LastSession = ($StartTimes | Sort-Object | Select-Object -Last 1).ToString("s")
+        }
+
+        $Safes = @($Group.Group | ForEach-Object { Get-ObjectStringValue -Item $_ -Names @("SafeName") } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique)
+        $Targets = @($Group.Group | ForEach-Object { Get-ObjectStringValue -Item $_ -Names @("RemoteMachine", "AccountAddress") } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique)
+        $Protocols = @($Group.Group | ForEach-Object { Get-ObjectStringValue -Item $_ -Names @("Protocol", "PSMProtocol") } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique)
+        $Clients = @($Group.Group | ForEach-Object { Get-ObjectStringValue -Item $_ -Names @("Client", "PSMClientApp") } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique)
+
+        $ExportData += [PSCustomObject][ordered]@{
+            UserName       = $Group.Name
+            SessionCount   = $Group.Count
+            FirstSession   = $FirstSession
+            LastSession    = $LastSession
+            Protocols      = ($Protocols -join "; ")
+            Clients        = ($Clients -join "; ")
+            Safes          = ($Safes -join "; ")
+            RemoteMachines = ($Targets -join "; ")
+        }
+    }
+
+    if ($ExportData.Count -eq 0) {
+        Write-Warning "Recordings were returned, but no PSM vault user names were found in them."
+        return
+    }
+
+    $ExportData |
+        Sort-Object @{ Expression = "SessionCount"; Descending = $true }, UserName |
+        Export-Csv -Path $OutputFile -NoTypeInformation -Encoding UTF8
+
+    Write-Host "Export complete. Data saved to $OutputFile" -ForegroundColor Green
+}
+
 function Import-SafeMembersAndGroups {
     param (
         [Parameter(Mandatory = $true)]
@@ -1221,6 +1574,40 @@ function Export-SafeMembersAndGroups {
 }
 
 function Start-CyberArkApiRunner {
+    if ([string]::IsNullOrWhiteSpace($script:EnvironmentType)) {
+        $script:EnvironmentType = Read-Choice -Prompt "CyberArk environment" -Choices @("privilegecloud", "onprem")
+    }
+
+    if ($script:EnvironmentType -eq "onprem") {
+        if ([string]::IsNullOrWhiteSpace($script:PVWAUrl)) {
+            $script:PVWAUrl = Read-RequiredValue -Prompt "PVWA URL, e.g. https://pvwa.company.com/PasswordVault"
+        }
+        $script:PVWAUrl = Resolve-PVWAUrl -Url $script:PVWAUrl
+        $script:Token = Get-OnPremSessionToken -PVWAUrl $script:PVWAUrl -ExistingToken $script:Token
+
+        while ($true) {
+            Write-Host ""
+            Write-Host "CyberArk PowerShell API Runner - On-Prem" -ForegroundColor Cyan
+            Write-Host "PVWA: $script:PVWAUrl"
+            Write-Host "1. Export PSM users from recordings CSV (last $script:PsmLookbackDays days)"
+            Write-Host "2. Quit"
+            $Choice = Read-Host "Choose an option"
+
+            switch ($Choice) {
+                "1" {
+                    $PsmOutputFile = New-TimestampedOutputPath -Prefix "psm_users_past_$($script:PsmLookbackDays)_days"
+                    Export-PsmUsersFromRecordings -PVWAUrl $script:PVWAUrl -Token $script:Token -OutputFile $PsmOutputFile -LookbackDays $script:PsmLookbackDays
+                }
+                "2" {
+                    return
+                }
+                default {
+                    Write-Host "Choose 1 or 2." -ForegroundColor Yellow
+                }
+            }
+        }
+    }
+
     if ([string]::IsNullOrWhiteSpace($script:Subdomain)) {
         $script:Subdomain = Read-RequiredValue -Prompt "Privilege Cloud tenant subdomain, e.g. serviceslab"
     }
@@ -1230,13 +1617,9 @@ function Start-CyberArkApiRunner {
 
     $script:Token = Get-PlatformToken -Subdomain $script:Subdomain -ExistingToken $script:Token
 
-    if ([string]::IsNullOrWhiteSpace($script:OutputFile)) {
-        $script:OutputFile = New-TimestampedOutputPath -Prefix "safe_members_and_groups"
-    }
-
     while ($true) {
         Write-Host ""
-        Write-Host "CyberArk PowerShell API Runner" -ForegroundColor Cyan
+        Write-Host "CyberArk PowerShell API Runner - Privilege Cloud" -ForegroundColor Cyan
         Write-Host "1. Fetch safe members and groups CSV"
         Write-Host "2. Add safe members and groups from CSV"
         Write-Host "3. Quit"
@@ -1244,7 +1627,11 @@ function Start-CyberArkApiRunner {
 
         switch ($Choice) {
             "1" {
-                Export-SafeMembersAndGroups -Subdomain $script:Subdomain -Token $script:Token -OutputFile $script:OutputFile
+                $SafeOutputFile = $script:OutputFile
+                if ([string]::IsNullOrWhiteSpace($SafeOutputFile)) {
+                    $SafeOutputFile = New-TimestampedOutputPath -Prefix "safe_members_and_groups"
+                }
+                Export-SafeMembersAndGroups -Subdomain $script:Subdomain -Token $script:Token -OutputFile $SafeOutputFile
             }
             "2" {
                 if ([string]::IsNullOrWhiteSpace($script:CsvPath)) {
