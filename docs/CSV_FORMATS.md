@@ -56,6 +56,26 @@ MoveAccountsAndFolders
 
 Boolean values can be `TRUE` or `FALSE`. `RequestsAuthorizationLevel` should be numeric.
 
+## Safe CPM Assignment Export And Import
+
+The `Export safe CPM assignments CSV` option writes:
+
+```text
+SafeName,CurrentManagingCPM,ManagingCPM
+Windows-Safe,PasswordManager,PasswordManager
+Linux-Safe,PasswordManager,PasswordManager
+```
+
+Only edit `ManagingCPM`:
+
+- Set it to a CPM name to assign that CPM.
+- Leave it blank to make no change.
+- Set it to `NULL` or `<NONE>` to clear the CPM assignment.
+
+`CurrentManagingCPM` is informational. The importer re-reads the safe from the
+tenant before creating its update request, previews actual changes, and requires
+typing `APPLY`.
+
 ## PSM Users From Recordings Export
 
 The on-prem `Export PSM users from recordings CSV` option writes one row per

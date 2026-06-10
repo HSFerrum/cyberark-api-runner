@@ -17,7 +17,8 @@ On this Linux machine, PowerShell is available as `pwsh`.
 - Generated CSV files are ignored by Git because they can contain real tenant, safe, user, group, or permission data.
 - The import workflow skips existing safe members by default. It does not overwrite permissions for members that are already on a safe.
 - The PMTerminal platform audit is read-only. CyberArk does not document an in-place REST update for the CPM plug-in setting, so the runner does not attempt an unsupported tenant-wide change.
-- The authenticated account must have enough CyberArk permissions to list safes, read safe members, and manage safe members.
+- Safe CPM imports show a preview and require typing `APPLY` before changing any safe.
+- The authenticated account must have enough CyberArk permissions to list safes, read safe details, manage safes, and manage safe members.
 
 ## Run
 
@@ -41,6 +42,12 @@ To declare the import CSV on launch:
 
 ```bash
 pwsh ./CyberArkApiRunner.ps1 -Subdomain serviceslab -CsvPath ./safe_members_and_groups.csv
+```
+
+To declare a safe CPM assignment CSV on launch:
+
+```bash
+pwsh ./CyberArkApiRunner.ps1 -Subdomain serviceslab -SafeCpmCsvPath ./safe_cpm_assignments.csv
 ```
 
 The script follows the same authentication pattern used by FastPAS:
@@ -161,6 +168,34 @@ Calls:
 GET  https://<subdomain>.privilegecloud.cyberark.cloud/PasswordVault/API/Safes
 GET  https://<subdomain>.privilegecloud.cyberark.cloud/PasswordVault/API/Safes/<safeUrlId>/Members/<memberName>
 POST https://<subdomain>.privilegecloud.cyberark.cloud/PasswordVault/API/Safes/<safeUrlId>/Members
+```
+
+### Export And Update Safe CPM Assignments
+
+The export option writes a timestamped CSV:
+
+```text
+safe_cpm_assignments_20260610_121500.csv
+```
+
+The file contains:
+
+```text
+SafeName,CurrentManagingCPM,ManagingCPM
+```
+
+Edit `ManagingCPM` to the new CPM name. Leave it blank to skip the safe, or use
+`NULL` or `<NONE>` to clear the safe's CPM assignment. The importer reads each
+safe's current settings, previews only actual changes, and requires typing
+`APPLY` before updating anything. It preserves the safe's description, OLAC
+setting, and retention setting.
+
+Calls:
+
+```text
+GET https://<subdomain>.privilegecloud.cyberark.cloud/PasswordVault/API/Safes
+GET https://<subdomain>.privilegecloud.cyberark.cloud/PasswordVault/API/Safes/<safeUrlId>
+PUT https://<subdomain>.privilegecloud.cyberark.cloud/PasswordVault/API/Safes/<safeUrlId>
 ```
 
 ## Documentation

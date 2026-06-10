@@ -37,6 +37,9 @@ param (
     [string]$CsvPath,
 
     [Parameter(Mandatory = $false)]
+    [string]$SafeCpmCsvPath,
+
+    [Parameter(Mandatory = $false)]
     [string]$OutputFile,
 
     [Parameter(Mandatory = $false)]
@@ -1087,6 +1090,100 @@ function New-SafeLookup {
     return $Lookup
 }
 
+function Get-SafePropertyValue {
+    param (
+        [Parameter(Mandatory = $true)]
+        [object]$Safe,
+
+        [Parameter(Mandatory = $true)]
+        [string[]]$Names
+    )
+
+    foreach ($Name in $Names) {
+        if ($Safe.PSObject.Properties.Name -contains $Name) {
+            return $Safe.$Name
+        }
+    }
+
+    return $null
+}
+
+function Get-SafeUrlId {
+    param (
+        [Parameter(Mandatory = $true)]
+        [object]$Safe,
+
+        [Parameter(Mandatory = $true)]
+        [string]$SafeName
+    )
+
+    $SafeUrlId = Get-SafePropertyValue -Safe $Safe -Names @("safeUrlId", "SafeUrlId")
+    if ([string]::IsNullOrWhiteSpace([string]$SafeUrlId)) {
+        return [uri]::EscapeDataString($SafeName)
+    }
+
+    return [string]$SafeUrlId
+}
+
+function ConvertTo-DesiredManagingCpm {
+    param (
+        [Parameter(Mandatory = $false)]
+        [AllowNull()]
+        [object]$Value
+    )
+
+    if ($null -eq $Value) {
+        return $null
+    }
+
+    $Text = ([string]$Value).Trim()
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return $null
+    }
+    if ($Text -match "^(?i:NULL|<NONE>)$") {
+        return ""
+    }
+
+    return $Text
+}
+
+function New-SafeCpmUpdateBody {
+    param (
+        [Parameter(Mandatory = $true)]
+        [object]$Safe,
+
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string]$ManagingCPM
+    )
+
+    $SafeName = [string](Get-SafePropertyValue -Safe $Safe -Names @("safeName", "SafeName"))
+    if ([string]::IsNullOrWhiteSpace($SafeName)) {
+        throw "Safe details did not contain a safe name."
+    }
+
+    $Body = [ordered]@{
+        SafeName    = $SafeName
+        Description = [string](Get-SafePropertyValue -Safe $Safe -Names @("description", "Description"))
+        OLACEnabled = [bool](Get-SafePropertyValue -Safe $Safe -Names @("olacEnabled", "OLACEnabled"))
+        ManagingCPM = $ManagingCPM
+    }
+
+    $Versions = Get-SafePropertyValue -Safe $Safe -Names @("numberOfVersionsRetention", "NumberOfVersionsRetention")
+    $Days = Get-SafePropertyValue -Safe $Safe -Names @("numberOfDaysRetention", "NumberOfDaysRetention")
+    if ($null -ne $Versions -and -not [string]::IsNullOrWhiteSpace([string]$Versions)) {
+        $Body["NumberOfVersionsRetention"] = [int]$Versions
+    }
+    elseif ($null -ne $Days -and -not [string]::IsNullOrWhiteSpace([string]$Days)) {
+        $Body["NumberOfDaysRetention"] = [int]$Days
+    }
+    else {
+        throw "Safe $SafeName did not contain a retention setting."
+    }
+
+    return $Body
+}
+
 function Test-SafeMemberExists {
     param (
         [Parameter(Mandatory = $true)]
@@ -1573,6 +1670,190 @@ function Export-SafeMembersAndGroups {
     Write-Host "Export complete. Data saved to $OutputFile" -ForegroundColor Green
 }
 
+function Export-SafeCpmAssignments {
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$Subdomain,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Token,
+
+        [Parameter(Mandatory = $true)]
+        [string]$OutputFile
+    )
+
+    $TenantUrl = "https://$Subdomain.privilegecloud.cyberark.cloud/PasswordVault"
+    $Headers = @{
+        "Authorization" = $Token
+        "Content-Type"  = "application/json"
+    }
+
+    Write-Host "Fetching safes and their assigned CPMs..." -ForegroundColor Cyan
+    $Safes = @(Get-PagedVaultItems -BaseUrl $TenantUrl -Path "Safes" -Headers $Headers)
+    if ($Safes.Count -eq 0) {
+        Write-Warning "No safes found, or the token does not have permission to list safes."
+        return
+    }
+
+    $Rows = @()
+    foreach ($Safe in $Safes) {
+        $SafeName = [string](Get-SafePropertyValue -Safe $Safe -Names @("safeName", "SafeName"))
+        if ([string]::IsNullOrWhiteSpace($SafeName)) {
+            Write-Warning "Skipping a safe whose name could not be determined."
+            continue
+        }
+
+        $CurrentManagingCPM = [string](Get-SafePropertyValue -Safe $Safe -Names @("managingCPM", "ManagingCPM"))
+        $Rows += [PSCustomObject][ordered]@{
+            SafeName           = $SafeName
+            CurrentManagingCPM = $CurrentManagingCPM
+            ManagingCPM        = $CurrentManagingCPM
+        }
+    }
+
+    $Rows |
+        Sort-Object SafeName |
+        Export-Csv -Path $OutputFile -NoTypeInformation -Encoding UTF8
+
+    Write-Host "Export complete. Data saved to $OutputFile" -ForegroundColor Green
+    Write-Host "Edit ManagingCPM, leave it blank to skip a safe, or use NULL to clear the assignment." -ForegroundColor Yellow
+}
+
+function Import-SafeCpmAssignments {
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$Subdomain,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Token,
+
+        [Parameter(Mandatory = $true)]
+        [string]$CsvPath
+    )
+
+    if (-not (Test-Path -Path $CsvPath -PathType Leaf)) {
+        throw "CSV file not found: $CsvPath"
+    }
+
+    $Rows = @(Import-Csv -Path $CsvPath)
+    if ($Rows.Count -eq 0) {
+        Write-Warning "CSV contained no rows."
+        return
+    }
+    if ($Rows[0].PSObject.Properties.Name -notcontains "SafeName" -or
+        $Rows[0].PSObject.Properties.Name -notcontains "ManagingCPM") {
+        throw "CSV must contain SafeName and ManagingCPM columns."
+    }
+
+    $TenantUrl = "https://$Subdomain.privilegecloud.cyberark.cloud/PasswordVault"
+    $Headers = @{
+        "Authorization" = $Token
+        "Content-Type"  = "application/json"
+    }
+
+    Write-Host "Fetching current safe settings for comparison..." -ForegroundColor Cyan
+    $Safes = @(Get-PagedVaultItems -BaseUrl $TenantUrl -Path "Safes" -Headers $Headers)
+    $SafeLookup = New-SafeLookup -Safes $Safes
+    $Changes = @()
+    $Skipped = 0
+    $Failed = 0
+    $SeenSafes = @{}
+
+    foreach ($Row in $Rows) {
+        $SafeName = Get-RowValue -Row $Row -Names @("SafeName")
+        $DesiredManagingCPM = ConvertTo-DesiredManagingCpm -Value $Row.ManagingCPM
+
+        if ([string]::IsNullOrWhiteSpace($SafeName)) {
+            Write-Warning "Skipping a row with no SafeName."
+            $Skipped++
+            continue
+        }
+        if ($null -eq $DesiredManagingCPM) {
+            $Skipped++
+            continue
+        }
+        if ($SeenSafes.ContainsKey($SafeName)) {
+            Write-Warning "Skipping duplicate CSV row for safe $SafeName."
+            $Skipped++
+            continue
+        }
+        $SeenSafes[$SafeName] = $true
+
+        if (-not $SafeLookup.ContainsKey($SafeName)) {
+            Write-Warning "Skipping $SafeName because the safe was not found."
+            $Skipped++
+            continue
+        }
+
+        try {
+            $SafeUrlId = Get-SafeUrlId -Safe $SafeLookup[$SafeName] -SafeName $SafeName
+            $SafeDetails = Invoke-CyberArkGet -Uri "$TenantUrl/API/Safes/$SafeUrlId" -Headers $Headers
+            $CurrentManagingCPM = [string](Get-SafePropertyValue -Safe $SafeDetails -Names @("managingCPM", "ManagingCPM"))
+            if ([string]::Equals($CurrentManagingCPM, $DesiredManagingCPM, [StringComparison]::OrdinalIgnoreCase)) {
+                $Skipped++
+                continue
+            }
+
+            $Changes += [PSCustomObject]@{
+                SafeName           = $SafeName
+                CurrentManagingCPM = $CurrentManagingCPM
+                ManagingCPM        = $DesiredManagingCPM
+                SafeUrlId          = $SafeUrlId
+                SafeDetails        = $SafeDetails
+            }
+        }
+        catch {
+            Write-Warning "Failed to read current settings for $SafeName. $($_.Exception.Message)"
+            $Failed++
+        }
+    }
+
+    if ($Changes.Count -eq 0) {
+        Write-Host "No CPM assignment changes were found. Skipped: $Skipped; Failed: $Failed" -ForegroundColor Yellow
+        return
+    }
+
+    Write-Host ""
+    Write-Host "Proposed safe CPM changes:" -ForegroundColor Yellow
+    $Changes |
+        Select-Object SafeName, CurrentManagingCPM, @{ Name = "NewManagingCPM"; Expression = { $_.ManagingCPM } } |
+        Format-Table -AutoSize
+    Write-Warning "This will update $($Changes.Count) safe(s)."
+    $Confirmation = Read-Host "Type APPLY to continue"
+    if ($Confirmation -cne "APPLY") {
+        Write-Host "No changes were made." -ForegroundColor Yellow
+        return
+    }
+
+    $Updated = 0
+    foreach ($Change in $Changes) {
+        try {
+            $Body = New-SafeCpmUpdateBody -Safe $Change.SafeDetails -ManagingCPM $Change.ManagingCPM
+            $Uri = "$TenantUrl/API/Safes/$($Change.SafeUrlId)"
+            $null = Invoke-CyberArkJsonRequest -Method "PUT" -Uri $Uri -Headers $Headers -Body $Body
+
+            $VerifiedSafe = Invoke-CyberArkGet -Uri $Uri -Headers $Headers
+            $VerifiedManagingCPM = [string](Get-SafePropertyValue -Safe $VerifiedSafe -Names @("managingCPM", "ManagingCPM"))
+            if (-not [string]::Equals($VerifiedManagingCPM, $Change.ManagingCPM, [StringComparison]::OrdinalIgnoreCase)) {
+                throw "Verification returned ManagingCPM '$VerifiedManagingCPM'."
+            }
+
+            Write-Host "Updated $($Change.SafeName): '$($Change.CurrentManagingCPM)' -> '$($Change.ManagingCPM)'" -ForegroundColor Green
+            $Updated++
+        }
+        catch {
+            Write-Warning "Failed to update $($Change.SafeName). $($_.Exception.Message)"
+            $Failed++
+        }
+    }
+
+    Write-Host ""
+    Write-Host "Safe CPM import complete." -ForegroundColor Cyan
+    Write-Host "Updated: $Updated"
+    Write-Host "Skipped: $Skipped"
+    Write-Host "Failed:  $Failed"
+}
+
 function Get-PlatformIdentifier {
     param (
         [Parameter(Mandatory = $true)]
@@ -1802,7 +2083,9 @@ function Start-CyberArkApiRunner {
         Write-Host "1. Fetch safe members and groups CSV"
         Write-Host "2. Add safe members and groups from CSV"
         Write-Host "3. Audit platforms using the PMTerminal CPM plug-in"
-        Write-Host "4. Quit"
+        Write-Host "4. Export safe CPM assignments CSV"
+        Write-Host "5. Update safe CPM assignments from CSV"
+        Write-Host "6. Quit"
         $Choice = Read-Host "Choose an option"
 
         switch ($Choice) {
@@ -1824,10 +2107,20 @@ function Start-CyberArkApiRunner {
                 Export-PMTerminalPlatformAudit -Subdomain $script:Subdomain -Token $script:Token -OutputFile $PlatformAuditFile
             }
             "4" {
+                $SafeCpmOutputFile = New-TimestampedOutputPath -Prefix "safe_cpm_assignments"
+                Export-SafeCpmAssignments -Subdomain $script:Subdomain -Token $script:Token -OutputFile $SafeCpmOutputFile
+            }
+            "5" {
+                if ([string]::IsNullOrWhiteSpace($script:SafeCpmCsvPath)) {
+                    $script:SafeCpmCsvPath = Read-RequiredValue -Prompt "Safe CPM CSV file path"
+                }
+                Import-SafeCpmAssignments -Subdomain $script:Subdomain -Token $script:Token -CsvPath $script:SafeCpmCsvPath
+            }
+            "6" {
                 return
             }
             default {
-                Write-Host "Choose 1, 2, 3, or 4." -ForegroundColor Yellow
+                Write-Host "Choose 1, 2, 3, 4, 5, or 6." -ForegroundColor Yellow
             }
         }
     }
