@@ -16,6 +16,7 @@ On this Linux machine, PowerShell is available as `pwsh`.
 
 - Generated CSV files are ignored by Git because they can contain real tenant, safe, user, group, or permission data.
 - The import workflow skips existing safe members by default. It does not overwrite permissions for members that are already on a safe.
+- The PMTerminal platform audit is read-only. CyberArk does not document an in-place REST update for the CPM plug-in setting, so the runner does not attempt an unsupported tenant-wide change.
 - The authenticated account must have enough CyberArk permissions to list safes, read safe members, and manage safe members.
 
 ## Run
@@ -111,6 +112,23 @@ The export includes one row per PSM vault user:
 - `Clients`
 - `Safes`
 - `RemoteMachines`
+
+### Audit Platforms Using The PMTerminal CPM Plug-in
+
+Privilege Cloud mode calls:
+
+```text
+GET https://<subdomain>.privilegecloud.cyberark.cloud/PasswordVault/API/Platforms
+GET https://<subdomain>.privilegecloud.cyberark.cloud/PasswordVault/API/Platforms/<platformId>
+```
+
+The audit recursively checks each visible platform detail for values containing
+`PMTerminal` or `PMTerminal.exe`. Matches are displayed and written to a
+timestamped CSV with the platform ID, platform name, property path, current
+value, and proposed `CyberArk.TPC.exe` value.
+
+The operation is read-only because the documented platform REST API does not
+provide an in-place update for this CPM plug-in setting.
 
 ### Add Safe Members And Groups From CSV
 

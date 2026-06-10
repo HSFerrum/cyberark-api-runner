@@ -1573,6 +1573,185 @@ function Export-SafeMembersAndGroups {
     Write-Host "Export complete. Data saved to $OutputFile" -ForegroundColor Green
 }
 
+function Get-PlatformIdentifier {
+    param (
+        [Parameter(Mandatory = $true)]
+        [object]$Platform
+    )
+
+    foreach ($PropertyName in @("PlatformID", "platformID", "id")) {
+        if ($Platform.PSObject.Properties.Name -contains $PropertyName) {
+            $Value = [string]$Platform.$PropertyName
+            if (-not [string]::IsNullOrWhiteSpace($Value)) {
+                return $Value
+            }
+        }
+    }
+
+    if ($Platform.PSObject.Properties.Name -contains "general" -and $null -ne $Platform.general) {
+        if ($Platform.general.PSObject.Properties.Name -contains "id") {
+            return [string]$Platform.general.id
+        }
+    }
+
+    return ""
+}
+
+function Get-PlatformDisplayName {
+    param (
+        [Parameter(Mandatory = $true)]
+        [object]$Platform
+    )
+
+    if ($Platform.PSObject.Properties.Name -contains "Details" -and $null -ne $Platform.Details) {
+        if ($Platform.Details.PSObject.Properties.Name -contains "PolicyName") {
+            return [string]$Platform.Details.PolicyName
+        }
+    }
+    if ($Platform.PSObject.Properties.Name -contains "general" -and $null -ne $Platform.general) {
+        if ($Platform.general.PSObject.Properties.Name -contains "name") {
+            return [string]$Platform.general.name
+        }
+    }
+    if ($Platform.PSObject.Properties.Name -contains "Name") {
+        return [string]$Platform.Name
+    }
+
+    return ""
+}
+
+function Find-PlatformStringMatches {
+    param (
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [object]$Value,
+
+        [Parameter(Mandatory = $false)]
+        [string]$Path = ""
+    )
+
+    $Results = @()
+    if ($Value -is [string]) {
+        if ($Value -match "(?i)pmterminal(?:\.exe)?") {
+            $Results += [PSCustomObject]@{
+                PropertyPath = $Path
+                CurrentValue = $Value
+            }
+        }
+        return $Results
+    }
+
+    if ($Value -is [System.Collections.IDictionary]) {
+        foreach ($Key in $Value.Keys) {
+            $ChildPath = if ([string]::IsNullOrWhiteSpace($Path)) { [string]$Key } else { "$Path.$Key" }
+            $Results += @(Find-PlatformStringMatches -Value $Value[$Key] -Path $ChildPath)
+        }
+        return $Results
+    }
+
+    if ($Value -is [System.Collections.IEnumerable]) {
+        $Index = 0
+        foreach ($Item in $Value) {
+            $Results += @(Find-PlatformStringMatches -Value $Item -Path "$($Path)[$Index]")
+            $Index++
+        }
+        return $Results
+    }
+
+    if ($null -ne $Value -and $null -ne $Value.PSObject) {
+        foreach ($Property in $Value.PSObject.Properties) {
+            $ChildPath = if ([string]::IsNullOrWhiteSpace($Path)) { $Property.Name } else { "$Path.$($Property.Name)" }
+            $Results += @(Find-PlatformStringMatches -Value $Property.Value -Path $ChildPath)
+        }
+    }
+
+    return $Results
+}
+
+function Export-PMTerminalPlatformAudit {
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$Subdomain,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Token,
+
+        [Parameter(Mandatory = $true)]
+        [string]$OutputFile
+    )
+
+    $TenantUrl = "https://$Subdomain.privilegecloud.cyberark.cloud/PasswordVault"
+    $Headers = @{
+        "Authorization" = $Token
+        "Content-Type"  = "application/json"
+    }
+
+    Write-Host "Fetching target platforms..." -ForegroundColor Cyan
+    $Response = Invoke-CyberArkGet -Uri "$TenantUrl/API/Platforms" -Headers $Headers
+    $Platforms = @()
+    if ($Response.PSObject.Properties.Name -contains "Platforms" -and $null -ne $Response.Platforms) {
+        $Platforms = @($Response.Platforms)
+    }
+    elseif ($Response.PSObject.Properties.Name -contains "value" -and $null -ne $Response.value) {
+        $Platforms = @($Response.value)
+    }
+    elseif ($Response -is [array]) {
+        $Platforms = @($Response)
+    }
+
+    if ($Platforms.Count -eq 0) {
+        Write-Warning "No visible platforms were returned."
+        return
+    }
+
+    Write-Host "Inspecting $($Platforms.Count) platform(s) for PMTerminal CPM plug-in values..." -ForegroundColor Cyan
+    $AuditRows = @()
+    foreach ($Platform in $Platforms) {
+        $PlatformId = Get-PlatformIdentifier -Platform $Platform
+        if ([string]::IsNullOrWhiteSpace($PlatformId)) {
+            Write-Warning "Skipping a platform whose ID could not be determined."
+            continue
+        }
+
+        try {
+            $EncodedPlatformId = [uri]::EscapeDataString($PlatformId)
+            $Details = Invoke-CyberArkGet -Uri "$TenantUrl/API/Platforms/$EncodedPlatformId" -Headers $Headers
+            $PlatformName = Get-PlatformDisplayName -Platform $Details
+            if ([string]::IsNullOrWhiteSpace($PlatformName)) {
+                $PlatformName = Get-PlatformDisplayName -Platform $Platform
+            }
+
+            foreach ($Match in @(Find-PlatformStringMatches -Value $Details)) {
+                $AuditRows += [PSCustomObject]@{
+                    PlatformID   = $PlatformId
+                    PlatformName = $PlatformName
+                    PropertyPath = $Match.PropertyPath
+                    CurrentValue = $Match.CurrentValue
+                    TargetValue  = "CyberArk.TPC.exe"
+                }
+            }
+        }
+        catch {
+            Write-Warning "Failed to inspect platform $PlatformId. $($_.Exception.Message)"
+        }
+    }
+
+    if ($AuditRows.Count -eq 0) {
+        Write-Host "No PMTerminal CPM plug-in values were found." -ForegroundColor Green
+        return
+    }
+
+    $AuditRows |
+        Sort-Object PlatformID, PropertyPath |
+        Export-Csv -Path $OutputFile -NoTypeInformation -Encoding UTF8
+
+    Write-Host ""
+    Write-Host "Found $($AuditRows.Count) matching setting(s):" -ForegroundColor Yellow
+    $AuditRows | Format-Table PlatformID, PlatformName, PropertyPath, CurrentValue -AutoSize
+    Write-Host "Audit saved to $OutputFile" -ForegroundColor Green
+    Write-Warning "No changes were made. CyberArk does not document an in-place REST update for this platform setting."
+}
+
 function Start-CyberArkApiRunner {
     if ([string]::IsNullOrWhiteSpace($script:EnvironmentType)) {
         $script:EnvironmentType = Read-Choice -Prompt "CyberArk environment" -Choices @("privilegecloud", "onprem")
@@ -1622,7 +1801,8 @@ function Start-CyberArkApiRunner {
         Write-Host "CyberArk PowerShell API Runner - Privilege Cloud" -ForegroundColor Cyan
         Write-Host "1. Fetch safe members and groups CSV"
         Write-Host "2. Add safe members and groups from CSV"
-        Write-Host "3. Quit"
+        Write-Host "3. Audit platforms using the PMTerminal CPM plug-in"
+        Write-Host "4. Quit"
         $Choice = Read-Host "Choose an option"
 
         switch ($Choice) {
@@ -1640,10 +1820,14 @@ function Start-CyberArkApiRunner {
                 Import-SafeMembersAndGroups -Subdomain $script:Subdomain -Token $script:Token -CsvPath $script:CsvPath
             }
             "3" {
+                $PlatformAuditFile = New-TimestampedOutputPath -Prefix "pmterminal_platform_audit"
+                Export-PMTerminalPlatformAudit -Subdomain $script:Subdomain -Token $script:Token -OutputFile $PlatformAuditFile
+            }
+            "4" {
                 return
             }
             default {
-                Write-Host "Choose 1, 2, or 3." -ForegroundColor Yellow
+                Write-Host "Choose 1, 2, 3, or 4." -ForegroundColor Yellow
             }
         }
     }
