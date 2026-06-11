@@ -371,28 +371,41 @@ function Get-OAuthPlatformToken {
         [string]$ApplicationId,
 
         [Parameter(Mandatory = $true)]
-        [string]$ClientId
+        [string]$ClientId,
+
+        [Parameter(Mandatory = $false)]
+        [securestring]$ClientSecret
     )
 
-    $ClientSecret = ConvertFrom-SecureStringToPlainText -SecureString (Read-Host "OAuth client secret / password" -AsSecureString)
+    if ($null -eq $ClientSecret) {
+        $ClientSecret = Read-Host "OAuth client secret / password" -AsSecureString
+    }
+    $script:OAuthClientSecret = $ClientSecret
+    $PlainClientSecret = ConvertFrom-SecureStringToPlainText -SecureString $ClientSecret
     $TokenFields = @{
         grant_type    = "client_credentials"
         client_id     = $ClientId
-        client_secret = $ClientSecret
+        client_secret = $PlainClientSecret
     }
 
-    Write-Host "Requesting Identity OAuth token..." -ForegroundColor Cyan
-    $null = Invoke-FormPost -Uri "https://$IdentityHost/oauth2/token/$ApplicationId" -Body $TokenFields
+    try {
+        Write-Host "Requesting Identity OAuth token..." -ForegroundColor Cyan
+        $null = Invoke-FormPost -Uri "https://$IdentityHost/oauth2/token/$ApplicationId" -Body $TokenFields
 
-    Write-Host "Requesting Privilege Cloud platform token..." -ForegroundColor Cyan
-    $PlatformResponse = Invoke-FormPost -Uri "https://$IdentityHost/oauth2/platformtoken" -Body $TokenFields
-    $PlatformToken = Get-ResponseToken -Response $PlatformResponse
+        Write-Host "Requesting Privilege Cloud platform token..." -ForegroundColor Cyan
+        $PlatformResponse = Invoke-FormPost -Uri "https://$IdentityHost/oauth2/platformtoken" -Body $TokenFields
+        $PlatformToken = Get-ResponseToken -Response $PlatformResponse
 
-    if ([string]::IsNullOrWhiteSpace($PlatformToken)) {
-        throw "Platform token response did not contain a token."
+        if ([string]::IsNullOrWhiteSpace($PlatformToken)) {
+            throw "Platform token response did not contain a token."
+        }
+
+        return Format-AuthorizationToken -Token $PlatformToken
     }
-
-    return Format-AuthorizationToken -Token $PlatformToken
+    finally {
+        $PlainClientSecret = $null
+        $TokenFields = $null
+    }
 }
 
 function Get-Mechanisms {
@@ -663,10 +676,17 @@ function Get-InteractivePlatformToken {
         [string]$IdentityHost,
 
         [Parameter(Mandatory = $true)]
-        [string]$Username
+        [string]$Username,
+
+        [Parameter(Mandatory = $false)]
+        [securestring]$Password
     )
 
-    $Password = ConvertFrom-SecureStringToPlainText -SecureString (Read-Host "Interactive password" -AsSecureString)
+    if ($null -eq $Password) {
+        $Password = Read-Host "Interactive password" -AsSecureString
+    }
+    $script:InteractivePassword = $Password
+    $PlainPassword = ConvertFrom-SecureStringToPlainText -SecureString $Password
     $StartUrl = "https://$IdentityHost/Security/StartAuthentication"
     $AdvanceUrl = "https://$IdentityHost/Security/AdvanceAuthentication"
     $Headers = @{ "X-IDAP-NATIVE-CLIENT" = "true" }
@@ -694,8 +714,9 @@ function Get-InteractivePlatformToken {
         SessionId   = $SessionId
         MechanismId = $PasswordMechanism.MechanismId
         Action      = "Answer"
-        Answer      = $Password
+        Answer      = $PlainPassword
     }
+    $PlainPassword = $null
 
     $Token = Get-ResponseToken -Response $Current
     while ([string]::IsNullOrWhiteSpace($Token)) {
@@ -808,6 +829,64 @@ function Get-PlatformToken {
         $script:Username = Read-RequiredValue -Prompt "Interactive username"
     }
     return Get-InteractivePlatformToken -Subdomain $Subdomain -IdentityHost $script:IdentityHost -Username $script:Username
+}
+
+function Renew-PrivilegeCloudToken {
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$Subdomain
+    )
+
+    Write-Warning "The Privilege Cloud token was rejected. Renewing authentication and retrying the current request."
+    $CurrentAuthType = Get-Variable -Name "AuthType" -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+
+    if ($CurrentAuthType -eq "oauth") {
+        $CachedClientSecret = Get-Variable -Name "OAuthClientSecret" -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+        $NewToken = Get-OAuthPlatformToken `
+            -IdentityHost $script:IdentityHost `
+            -ApplicationId $script:ApplicationId `
+            -ClientId $script:ClientId `
+            -ClientSecret $CachedClientSecret
+    }
+    elseif ($CurrentAuthType -eq "interactive") {
+        $CachedPassword = Get-Variable -Name "InteractivePassword" -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+        $NewToken = Get-InteractivePlatformToken `
+            -Subdomain $Subdomain `
+            -IdentityHost $script:IdentityHost `
+            -Username $script:Username `
+            -Password $CachedPassword
+    }
+    else {
+        $NewToken = Read-Token
+    }
+
+    $script:Token = $NewToken
+    return $NewToken
+}
+
+function Invoke-WithPrivilegeCloudTokenRefresh {
+    param (
+        [Parameter(Mandatory = $true)]
+        [scriptblock]$Operation,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Subdomain,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Headers
+    )
+
+    try {
+        return & $Operation
+    }
+    catch {
+        if ([string]$_.Exception.Message -notmatch "HTTP (401|403)") {
+            throw
+        }
+
+        $Headers["Authorization"] = Renew-PrivilegeCloudToken -Subdomain $Subdomain
+        return & $Operation
+    }
 }
 
 function New-TimestampedOutputPath {
@@ -1202,6 +1281,34 @@ function Find-SafeByName {
     }
 
     return $Matches[0]
+}
+
+function Save-SafeCpmCheckpoint {
+    param (
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [object[]]$Rows,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    if ($Rows.Count -eq 0) {
+        if (Test-Path -Path $Path -PathType Leaf) {
+            Remove-Item -Path $Path -Force
+        }
+        return
+    }
+
+    $Rows |
+        ForEach-Object {
+            [PSCustomObject][ordered]@{
+                SafeName           = $_.SafeName
+                CurrentManagingCPM = $_.CurrentManagingCPM
+                ManagingCPM        = if ([string]::IsNullOrEmpty([string]$_.ManagingCPM)) { "NULL" } else { $_.ManagingCPM }
+            }
+        } |
+        Export-Csv -Path $Path -NoTypeInformation -Encoding UTF8
 }
 
 function Test-SafeMemberExists {
@@ -1824,8 +1931,12 @@ function Import-SafeCpmAssignments {
     Write-Host ""
     Write-Host "Proposed safe CPM changes from the CSV:" -ForegroundColor Yellow
     $EditedRows |
+        Select-Object -First 25 |
         Select-Object SafeName, CurrentManagingCPM, @{ Name = "NewManagingCPM"; Expression = { $_.ManagingCPM } } |
         Format-Table -AutoSize
+    if ($EditedRows.Count -gt 25) {
+        Write-Host "Showing the first 25 of $($EditedRows.Count) edited rows." -ForegroundColor Yellow
+    }
     Write-Warning "This will check and potentially update $($EditedRows.Count) safe(s)."
     $Confirmation = Read-Host "Type APPLY to continue"
     if ($Confirmation -cne "APPLY") {
@@ -1833,14 +1944,24 @@ function Import-SafeCpmAssignments {
         return
     }
 
+    $CheckpointDirectory = Split-Path -Parent (Resolve-Path -Path $CsvPath)
+    $CheckpointName = "safe_cpm_remaining_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+    $CheckpointPath = Join-Path -Path $CheckpointDirectory -ChildPath $CheckpointName
+    $RemainingRows = @($EditedRows)
+    Save-SafeCpmCheckpoint -Rows $RemainingRows -Path $CheckpointPath
+    Write-Host "Resume checkpoint: $CheckpointPath" -ForegroundColor Cyan
+
     $Updated = 0
+    $ProcessedSinceCheckpoint = 0
     Write-Host "Applying edited rows without fetching unchanged safes..." -ForegroundColor Cyan
     foreach ($EditedRow in $EditedRows) {
         $SafeName = $EditedRow.SafeName
         $DesiredManagingCPM = $EditedRow.ManagingCPM
 
         try {
-            $SafeDetails = Find-SafeByName -TenantUrl $TenantUrl -SafeName $SafeName -Headers $Headers
+            $SafeDetails = Invoke-WithPrivilegeCloudTokenRefresh -Subdomain $Subdomain -Headers $Headers -Operation {
+                Find-SafeByName -TenantUrl $TenantUrl -SafeName $SafeName -Headers $Headers
+            }
             $SafeUrlId = [string](Get-SafePropertyValue -Safe $SafeDetails -Names @("safeUrlId", "SafeUrlId"))
             if ([string]::IsNullOrWhiteSpace($SafeUrlId)) {
                 throw "Safe '$SafeName' did not contain a safeUrlId."
@@ -1850,33 +1971,52 @@ function Import-SafeCpmAssignments {
             if ([string]::Equals($CurrentManagingCPM, $DesiredManagingCPM, [StringComparison]::OrdinalIgnoreCase)) {
                 Write-Host "Skipping $SafeName because it already uses '$DesiredManagingCPM'." -ForegroundColor Yellow
                 $Skipped++
-                continue
+            }
+            else {
+                $Body = New-SafeCpmUpdateBody -Safe $SafeDetails -ManagingCPM $DesiredManagingCPM
+                $Uri = "$TenantUrl/API/Safes/$SafeUrlId"
+                $null = Invoke-WithPrivilegeCloudTokenRefresh -Subdomain $Subdomain -Headers $Headers -Operation {
+                    Invoke-CyberArkJsonRequest -Method "PUT" -Uri $Uri -Headers $Headers -Body $Body
+                }
+
+                $VerifiedSafe = Invoke-WithPrivilegeCloudTokenRefresh -Subdomain $Subdomain -Headers $Headers -Operation {
+                    Find-SafeByName -TenantUrl $TenantUrl -SafeName $SafeName -Headers $Headers
+                }
+                $VerifiedManagingCPM = [string](Get-SafePropertyValue -Safe $VerifiedSafe -Names @("managingCPM", "ManagingCPM"))
+                if (-not [string]::Equals($VerifiedManagingCPM, $DesiredManagingCPM, [StringComparison]::OrdinalIgnoreCase)) {
+                    throw "Verification returned ManagingCPM '$VerifiedManagingCPM'."
+                }
+
+                Write-Host "Updated $SafeName`: '$CurrentManagingCPM' -> '$DesiredManagingCPM'" -ForegroundColor Green
+                $Updated++
             }
 
-            $Body = New-SafeCpmUpdateBody -Safe $SafeDetails -ManagingCPM $DesiredManagingCPM
-            $Uri = "$TenantUrl/API/Safes/$SafeUrlId"
-            $null = Invoke-CyberArkJsonRequest -Method "PUT" -Uri $Uri -Headers $Headers -Body $Body
-
-            $VerifiedSafe = Find-SafeByName -TenantUrl $TenantUrl -SafeName $SafeName -Headers $Headers
-            $VerifiedManagingCPM = [string](Get-SafePropertyValue -Safe $VerifiedSafe -Names @("managingCPM", "ManagingCPM"))
-            if (-not [string]::Equals($VerifiedManagingCPM, $DesiredManagingCPM, [StringComparison]::OrdinalIgnoreCase)) {
-                throw "Verification returned ManagingCPM '$VerifiedManagingCPM'."
+            $RemainingRows = @($RemainingRows | Where-Object { $_.SafeName -ne $SafeName })
+            $ProcessedSinceCheckpoint++
+            if ($ProcessedSinceCheckpoint -ge 25) {
+                Save-SafeCpmCheckpoint -Rows $RemainingRows -Path $CheckpointPath
+                $ProcessedSinceCheckpoint = 0
             }
-
-            Write-Host "Updated $SafeName`: '$CurrentManagingCPM' -> '$DesiredManagingCPM'" -ForegroundColor Green
-            $Updated++
         }
         catch {
             Write-Warning "Failed to update $SafeName. $($_.Exception.Message)"
             $Failed++
+            Save-SafeCpmCheckpoint -Rows $RemainingRows -Path $CheckpointPath
         }
     }
 
+    Save-SafeCpmCheckpoint -Rows $RemainingRows -Path $CheckpointPath
     Write-Host ""
     Write-Host "Safe CPM import complete." -ForegroundColor Cyan
     Write-Host "Updated: $Updated"
     Write-Host "Skipped: $Skipped"
     Write-Host "Failed:  $Failed"
+    if ($RemainingRows.Count -gt 0) {
+        Write-Host "Resume unfinished rows with: $CheckpointPath" -ForegroundColor Yellow
+    }
+    else {
+        Write-Host "All edited rows were completed; the resume checkpoint was removed." -ForegroundColor Green
+    }
 }
 
 function Get-PlatformIdentifier {

@@ -79,6 +79,16 @@ requests. The CSV preview and `APPLY` confirmation happen before API calls, then
 each edited safe is read, updated, and verified immediately. The exact safe and
 its `safeUrlId` are resolved with CyberArk's filtered safe search.
 
+Before applying changes, the importer creates a
+`safe_cpm_remaining_<timestamp>.csv` checkpoint in the source CSV directory.
+It periodically removes completed rows. Re-import this checkpoint after an
+interruption to resume unfinished work. The checkpoint contains no token,
+password, or OAuth secret.
+
+During the batch, an HTTP 401 or 403 triggers token renewal and one retry of the
+current request. OAuth credentials are retained only in process memory;
+interactive authentication can require another MFA approval.
+
 ## PSM Users From Recordings Export
 
 The on-prem `Export PSM users from recordings CSV` option writes one row per

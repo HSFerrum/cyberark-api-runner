@@ -18,6 +18,8 @@ On this Linux machine, PowerShell is available as `pwsh`.
 - The import workflow skips existing safe members by default. It does not overwrite permissions for members that are already on a safe.
 - The PMTerminal platform audit is read-only. CyberArk does not document an in-place REST update for the CPM plug-in setting, so the runner does not attempt an unsupported tenant-wide change.
 - Safe CPM imports show a preview and require typing `APPLY` before changing any safe.
+- Long safe CPM imports renew authentication after a 401/403 and retry the current request once.
+- Safe CPM imports maintain a CSV checkpoint containing only unfinished rows.
 - The authenticated account must have enough CyberArk permissions to list safes, read safe details, manage safes, and manage safe members.
 
 ## Run
@@ -193,6 +195,17 @@ setting, and retention setting. The importer first compares `ManagingCPM` with
 For example, changing one row in a 2,800-safe export results in one safe lookup,
 not 2,800 lookups. The CSV preview and `APPLY` confirmation occur before those
 API calls; afterward, each edited safe is read, updated, and verified immediately.
+
+For large batches, the runner creates `safe_cpm_remaining_<timestamp>.csv` beside
+the imported file. Completed rows are removed from the checkpoint periodically,
+and the file is deleted when the batch finishes. If the run is interrupted, use
+menu option 5 with the remaining file to resume unfinished rows.
+
+If CyberArk returns HTTP 401 or 403 during a request, the runner renews the
+Privilege Cloud token and retries that request once. OAuth renewal uses the
+client secret retained only in process memory and is normally automatic.
+Interactive authentication may prompt for MFA approval. If the runner was
+started with a pre-created `-Token`, it prompts for a replacement platform token.
 
 Calls:
 
