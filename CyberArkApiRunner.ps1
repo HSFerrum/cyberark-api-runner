@@ -1246,6 +1246,45 @@ function New-SafeCpmUpdateBody {
     return $Body
 }
 
+function New-SafeCpmUpdateBodyFromCsv {
+    param (
+        [Parameter(Mandatory = $true)]
+        [object]$Row,
+
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string]$ManagingCPM
+    )
+
+    $SafeName = Get-RowValue -Row $Row -Names @("SafeName")
+    $OlacValue = ConvertTo-CyberArkBoolean -Value $Row.OLACEnabled
+    if ($OlacValue -isnot [bool]) {
+        throw "Safe $SafeName has an invalid OLACEnabled value '$($Row.OLACEnabled)'."
+    }
+
+    $Body = [ordered]@{
+        SafeName    = $SafeName
+        Description = [string]$Row.Description
+        OLACEnabled = $OlacValue
+        ManagingCPM = $ManagingCPM
+    }
+
+    $VersionsText = ([string]$Row.NumberOfVersionsRetention).Trim()
+    $DaysText = ([string]$Row.NumberOfDaysRetention).Trim()
+    $Retention = 0
+    if (-not [string]::IsNullOrWhiteSpace($VersionsText) -and [int]::TryParse($VersionsText, [ref]$Retention)) {
+        $Body["NumberOfVersionsRetention"] = $Retention
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($DaysText) -and [int]::TryParse($DaysText, [ref]$Retention)) {
+        $Body["NumberOfDaysRetention"] = $Retention
+    }
+    else {
+        throw "Safe $SafeName does not have a valid retention value in the CSV."
+    }
+
+    return $Body
+}
+
 function Find-SafeByName {
     param (
         [Parameter(Mandatory = $true)]
@@ -1303,9 +1342,15 @@ function Save-SafeCpmCheckpoint {
     $Rows |
         ForEach-Object {
             [PSCustomObject][ordered]@{
+                CpmUpdateMode      = $_.CpmUpdateMode
                 SafeName           = $_.SafeName
+                SafeUrlId          = $_.SafeUrlId
                 CurrentManagingCPM = $_.CurrentManagingCPM
                 ManagingCPM        = if ([string]::IsNullOrEmpty([string]$_.ManagingCPM)) { "NULL" } else { $_.ManagingCPM }
+                Description        = $_.Description
+                OLACEnabled        = $_.OLACEnabled
+                NumberOfVersionsRetention = $_.NumberOfVersionsRetention
+                NumberOfDaysRetention     = $_.NumberOfDaysRetention
             }
         } |
         Export-Csv -Path $Path -NoTypeInformation -Encoding UTF8
@@ -1832,9 +1877,15 @@ function Export-SafeCpmAssignments {
 
         $CurrentManagingCPM = [string](Get-SafePropertyValue -Safe $Safe -Names @("managingCPM", "ManagingCPM"))
         $Rows += [PSCustomObject][ordered]@{
-            SafeName           = $SafeName
-            CurrentManagingCPM = $CurrentManagingCPM
-            ManagingCPM        = $CurrentManagingCPM
+            CpmUpdateMode                = "DirectWrite"
+            SafeName                     = $SafeName
+            SafeUrlId                    = [string](Get-SafePropertyValue -Safe $Safe -Names @("safeUrlId", "SafeUrlId"))
+            CurrentManagingCPM           = $CurrentManagingCPM
+            ManagingCPM                  = $CurrentManagingCPM
+            Description                  = [string](Get-SafePropertyValue -Safe $Safe -Names @("description", "Description"))
+            OLACEnabled                  = Get-SafePropertyValue -Safe $Safe -Names @("olacEnabled", "OLACEnabled")
+            NumberOfVersionsRetention    = Get-SafePropertyValue -Safe $Safe -Names @("numberOfVersionsRetention", "NumberOfVersionsRetention")
+            NumberOfDaysRetention        = Get-SafePropertyValue -Safe $Safe -Names @("numberOfDaysRetention", "NumberOfDaysRetention")
         }
     }
 
@@ -1879,8 +1930,26 @@ function Import-SafeCpmAssignments {
     }
 
     $HasCurrentManagingCpmColumn = $Rows[0].PSObject.Properties.Name -contains "CurrentManagingCPM"
+    $DirectWriteColumns = @(
+        "SafeUrlId",
+        "Description",
+        "OLACEnabled",
+        "NumberOfVersionsRetention",
+        "NumberOfDaysRetention"
+    )
+    $HasDirectWriteColumns = ($DirectWriteColumns | Where-Object { $Rows[0].PSObject.Properties.Name -notcontains $_ }).Count -eq 0
+    $CanDirectWrite = $HasDirectWriteColumns -and
+        $Rows[0].PSObject.Properties.Name -contains "CpmUpdateMode" -and
+        [string]::Equals(([string]$Rows[0].CpmUpdateMode).Trim(), "DirectWrite", [StringComparison]::OrdinalIgnoreCase)
     if (-not $HasCurrentManagingCpmColumn) {
         Write-Warning "CSV has no CurrentManagingCPM column. Every nonblank row must be checked against CyberArk."
+    }
+    if ($CanDirectWrite) {
+        Write-Host "Direct-write CSV detected. Changed safes will be updated without pre-read or verification queries." -ForegroundColor Cyan
+        Write-Warning "Edit only ManagingCPM. Use a recent export to avoid overwriting newer safe settings."
+    }
+    else {
+        Write-Warning "Legacy CSV detected. Each changed safe requires lookup and verification requests."
     }
 
     $Skipped = 0
@@ -1917,9 +1986,15 @@ function Import-SafeCpmAssignments {
         }
 
         $EditedRows += [PSCustomObject]@{
-            SafeName           = $SafeName
-            CurrentManagingCPM = if ($HasCurrentManagingCpmColumn) { ([string]$Row.CurrentManagingCPM).Trim() } else { "<not provided>" }
-            ManagingCPM        = $DesiredManagingCPM
+            CpmUpdateMode                = if ($CanDirectWrite) { "DirectWrite" } else { "Legacy" }
+            SafeName                     = $SafeName
+            SafeUrlId                    = if ($CanDirectWrite) { ([string]$Row.SafeUrlId).Trim() } else { "" }
+            CurrentManagingCPM           = if ($HasCurrentManagingCpmColumn) { ([string]$Row.CurrentManagingCPM).Trim() } else { "<not provided>" }
+            ManagingCPM                  = $DesiredManagingCPM
+            Description                  = if ($CanDirectWrite) { [string]$Row.Description } else { "" }
+            OLACEnabled                  = if ($CanDirectWrite) { [string]$Row.OLACEnabled } else { "" }
+            NumberOfVersionsRetention    = if ($CanDirectWrite) { [string]$Row.NumberOfVersionsRetention } else { "" }
+            NumberOfDaysRetention        = if ($CanDirectWrite) { [string]$Row.NumberOfDaysRetention } else { "" }
         }
     }
 
@@ -1959,20 +2034,34 @@ function Import-SafeCpmAssignments {
         $DesiredManagingCPM = $EditedRow.ManagingCPM
 
         try {
-            $SafeDetails = Invoke-WithPrivilegeCloudTokenRefresh -Subdomain $Subdomain -Headers $Headers -Operation {
-                Find-SafeByName -TenantUrl $TenantUrl -SafeName $SafeName -Headers $Headers
-            }
-            $SafeUrlId = [string](Get-SafePropertyValue -Safe $SafeDetails -Names @("safeUrlId", "SafeUrlId"))
-            if ([string]::IsNullOrWhiteSpace($SafeUrlId)) {
-                throw "Safe '$SafeName' did not contain a safeUrlId."
-            }
-
-            $CurrentManagingCPM = [string](Get-SafePropertyValue -Safe $SafeDetails -Names @("managingCPM", "ManagingCPM"))
-            if ([string]::Equals($CurrentManagingCPM, $DesiredManagingCPM, [StringComparison]::OrdinalIgnoreCase)) {
-                Write-Host "Skipping $SafeName because it already uses '$DesiredManagingCPM'." -ForegroundColor Yellow
-                $Skipped++
+            if ($CanDirectWrite) {
+                $SafeUrlId = $EditedRow.SafeUrlId
+                if ([string]::IsNullOrWhiteSpace($SafeUrlId)) {
+                    throw "Safe '$SafeName' has no SafeUrlId in the CSV."
+                }
+                $Body = New-SafeCpmUpdateBodyFromCsv -Row $EditedRow -ManagingCPM $DesiredManagingCPM
+                $Uri = "$TenantUrl/API/Safes/$SafeUrlId"
+                $null = Invoke-WithPrivilegeCloudTokenRefresh -Subdomain $Subdomain -Headers $Headers -Operation {
+                    Invoke-CyberArkJsonRequest -Method "PUT" -Uri $Uri -Headers $Headers -Body $Body
+                }
+                Write-Host "Updated $SafeName`: '$($EditedRow.CurrentManagingCPM)' -> '$DesiredManagingCPM'" -ForegroundColor Green
+                $Updated++
             }
             else {
+                $SafeDetails = Invoke-WithPrivilegeCloudTokenRefresh -Subdomain $Subdomain -Headers $Headers -Operation {
+                    Find-SafeByName -TenantUrl $TenantUrl -SafeName $SafeName -Headers $Headers
+                }
+                $SafeUrlId = [string](Get-SafePropertyValue -Safe $SafeDetails -Names @("safeUrlId", "SafeUrlId"))
+                if ([string]::IsNullOrWhiteSpace($SafeUrlId)) {
+                    throw "Safe '$SafeName' did not contain a safeUrlId."
+                }
+
+                $CurrentManagingCPM = [string](Get-SafePropertyValue -Safe $SafeDetails -Names @("managingCPM", "ManagingCPM"))
+                if ([string]::Equals($CurrentManagingCPM, $DesiredManagingCPM, [StringComparison]::OrdinalIgnoreCase)) {
+                    Write-Host "Skipping $SafeName because it already uses '$DesiredManagingCPM'." -ForegroundColor Yellow
+                    $Skipped++
+                }
+                else {
                 $Body = New-SafeCpmUpdateBody -Safe $SafeDetails -ManagingCPM $DesiredManagingCPM
                 $Uri = "$TenantUrl/API/Safes/$SafeUrlId"
                 $null = Invoke-WithPrivilegeCloudTokenRefresh -Subdomain $Subdomain -Headers $Headers -Operation {
@@ -1989,6 +2078,7 @@ function Import-SafeCpmAssignments {
 
                 Write-Host "Updated $SafeName`: '$CurrentManagingCPM' -> '$DesiredManagingCPM'" -ForegroundColor Green
                 $Updated++
+                }
             }
 
             $RemainingRows = @($RemainingRows | Where-Object { $_.SafeName -ne $SafeName })

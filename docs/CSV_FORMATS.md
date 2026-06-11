@@ -61,9 +61,9 @@ Boolean values can be `TRUE` or `FALSE`. `RequestsAuthorizationLevel` should be 
 The `Export safe CPM assignments CSV` option writes:
 
 ```text
-SafeName,CurrentManagingCPM,ManagingCPM
-Windows-Safe,PasswordManager,PasswordManager
-Linux-Safe,PasswordManager,PasswordManager
+CpmUpdateMode,SafeName,SafeUrlId,CurrentManagingCPM,ManagingCPM,Description,OLACEnabled,NumberOfVersionsRetention,NumberOfDaysRetention
+DirectWrite,Windows-Safe,42,PasswordManager,PasswordManager,Windows accounts,FALSE,5,
+DirectWrite,Linux-Safe,43,PasswordManager,PasswordManager,Linux accounts,FALSE,,30
 ```
 
 Only edit `ManagingCPM`:
@@ -72,12 +72,15 @@ Only edit `ManagingCPM`:
 - Leave it blank to make no change.
 - Set it to `NULL` or `<NONE>` to clear the CPM assignment.
 
-`CurrentManagingCPM` is the exported baseline and should not be edited. The
-importer compares it locally with `ManagingCPM`, then contacts CyberArk only for
-rows whose values differ. It re-reads those edited safes before creating update
-requests. The CSV preview and `APPLY` confirmation happen before API calls, then
-each edited safe is read, updated, and verified immediately. The exact safe and
-its `safeUrlId` are resolved with CyberArk's filtered safe search.
+Do not edit `CpmUpdateMode`, `SafeUrlId`, `CurrentManagingCPM`, `Description`,
+`OLACEnabled`, or the retention columns. They are the exported snapshot metadata
+used to build CyberArk's full safe update body.
+
+With all snapshot columns present, the importer uses direct-write mode: it
+compares CPM values locally and sends one `PUT` per changed row without safe
+lookup or verification requests. Use a recent export because newer description,
+OLAC, or retention changes made after export could be overwritten by the CSV
+snapshot. Legacy three-column files are supported with the slower queried mode.
 
 Before applying changes, the importer creates a
 `safe_cpm_remaining_<timestamp>.csv` checkpoint in the source CSV directory.

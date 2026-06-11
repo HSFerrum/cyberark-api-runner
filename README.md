@@ -183,18 +183,22 @@ safe_cpm_assignments_20260610_121500.csv
 The file contains:
 
 ```text
-SafeName,CurrentManagingCPM,ManagingCPM
+CpmUpdateMode,SafeName,SafeUrlId,CurrentManagingCPM,ManagingCPM,Description,OLACEnabled,NumberOfVersionsRetention,NumberOfDaysRetention
 ```
 
-Edit `ManagingCPM` to the new CPM name. Leave it blank to skip the safe, or use
-`NULL` or `<NONE>` to clear the safe's CPM assignment. The importer reads each
-safe's current settings, previews only actual changes, and requires typing
-`APPLY` before updating anything. It preserves the safe's description, OLAC
-setting, and retention setting. The importer first compares `ManagingCPM` with
-`CurrentManagingCPM` inside the CSV and contacts CyberArk only for edited rows.
-For example, changing one row in a 2,800-safe export results in one safe lookup,
-not 2,800 lookups. The CSV preview and `APPLY` confirmation occur before those
-API calls; afterward, each edited safe is read, updated, and verified immediately.
+Edit only `ManagingCPM`. Leave it blank to skip the safe, or use `NULL` or
+`<NONE>` to clear the assignment. The remaining columns form the safe snapshot
+required by CyberArk's full safe `PUT`; do not edit them.
+
+New-format exports use direct-write mode. The runner compares `ManagingCPM` with
+`CurrentManagingCPM` locally, previews changes, then sends one `PUT` per changed
+safe without first querying or subsequently verifying that safe. A 2,800-safe
+change therefore requires about 2,800 API calls instead of roughly 8,400.
+
+Use a recent export. Because description, OLAC, and retention are sent from the
+CSV snapshot, direct-write mode could overwrite newer changes made to those safe
+properties after the export. Older three-column CSV files remain supported but
+use the slower lookup-and-verification workflow.
 
 For large batches, the runner creates `safe_cpm_remaining_<timestamp>.csv` beside
 the imported file. Completed rows are removed from the checkpoint periodically,
@@ -211,7 +215,6 @@ Calls:
 
 ```text
 GET https://<subdomain>.privilegecloud.cyberark.cloud/PasswordVault/API/Safes
-GET https://<subdomain>.privilegecloud.cyberark.cloud/PasswordVault/API/Safes?search=<safeName>
 PUT https://<subdomain>.privilegecloud.cyberark.cloud/PasswordVault/API/Safes/<safeUrlId>
 ```
 
