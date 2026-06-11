@@ -1108,23 +1108,6 @@ function Get-SafePropertyValue {
     return $null
 }
 
-function Get-SafeUrlId {
-    param (
-        [Parameter(Mandatory = $true)]
-        [object]$Safe,
-
-        [Parameter(Mandatory = $true)]
-        [string]$SafeName
-    )
-
-    $SafeUrlId = Get-SafePropertyValue -Safe $Safe -Names @("safeUrlId", "SafeUrlId")
-    if ([string]::IsNullOrWhiteSpace([string]$SafeUrlId)) {
-        return [uri]::EscapeDataString($SafeName)
-    }
-
-    return [string]$SafeUrlId
-}
-
 function ConvertTo-DesiredManagingCpm {
     param (
         [Parameter(Mandatory = $false)]
@@ -1182,6 +1165,43 @@ function New-SafeCpmUpdateBody {
     }
 
     return $Body
+}
+
+function Find-SafeByName {
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$TenantUrl,
+
+        [Parameter(Mandatory = $true)]
+        [string]$SafeName,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Headers
+    )
+
+    $EncodedName = [uri]::EscapeDataString($SafeName)
+    $Response = Invoke-CyberArkGet -Uri "$TenantUrl/API/Safes?search=$EncodedName&limit=100&offset=0" -Headers $Headers
+    $Candidates = @()
+    if ($Response.PSObject.Properties.Name -contains "value" -and $null -ne $Response.value) {
+        $Candidates = @($Response.value)
+    }
+    elseif ($Response -is [array]) {
+        $Candidates = @($Response)
+    }
+
+    $Matches = @($Candidates | Where-Object {
+        $CandidateName = [string](Get-SafePropertyValue -Safe $_ -Names @("safeName", "SafeName"))
+        [string]::Equals($CandidateName, $SafeName, [StringComparison]::OrdinalIgnoreCase)
+    })
+
+    if ($Matches.Count -eq 0) {
+        throw "Safe '$SafeName' was not found."
+    }
+    if ($Matches.Count -gt 1) {
+        throw "More than one exact match was returned for safe '$SafeName'."
+    }
+
+    return $Matches[0]
 }
 
 function Test-SafeMemberExists {
@@ -1751,9 +1771,7 @@ function Import-SafeCpmAssignments {
         "Content-Type"  = "application/json"
     }
 
-    Write-Host "Fetching current safe settings for comparison..." -ForegroundColor Cyan
-    $Safes = @(Get-PagedVaultItems -BaseUrl $TenantUrl -Path "Safes" -Headers $Headers)
-    $SafeLookup = New-SafeLookup -Safes $Safes
+    Write-Host "Fetching current settings for the safes listed in the CSV..." -ForegroundColor Cyan
     $Changes = @()
     $Skipped = 0
     $Failed = 0
@@ -1779,15 +1797,12 @@ function Import-SafeCpmAssignments {
         }
         $SeenSafes[$SafeName] = $true
 
-        if (-not $SafeLookup.ContainsKey($SafeName)) {
-            Write-Warning "Skipping $SafeName because the safe was not found."
-            $Skipped++
-            continue
-        }
-
         try {
-            $SafeUrlId = Get-SafeUrlId -Safe $SafeLookup[$SafeName] -SafeName $SafeName
-            $SafeDetails = Invoke-CyberArkGet -Uri "$TenantUrl/API/Safes/$SafeUrlId" -Headers $Headers
+            $SafeDetails = Find-SafeByName -TenantUrl $TenantUrl -SafeName $SafeName -Headers $Headers
+            $SafeUrlId = [string](Get-SafePropertyValue -Safe $SafeDetails -Names @("safeUrlId", "SafeUrlId"))
+            if ([string]::IsNullOrWhiteSpace($SafeUrlId)) {
+                throw "Safe '$SafeName' did not contain a safeUrlId."
+            }
             $CurrentManagingCPM = [string](Get-SafePropertyValue -Safe $SafeDetails -Names @("managingCPM", "ManagingCPM"))
             if ([string]::Equals($CurrentManagingCPM, $DesiredManagingCPM, [StringComparison]::OrdinalIgnoreCase)) {
                 $Skipped++
@@ -1832,7 +1847,7 @@ function Import-SafeCpmAssignments {
             $Uri = "$TenantUrl/API/Safes/$($Change.SafeUrlId)"
             $null = Invoke-CyberArkJsonRequest -Method "PUT" -Uri $Uri -Headers $Headers -Body $Body
 
-            $VerifiedSafe = Invoke-CyberArkGet -Uri $Uri -Headers $Headers
+            $VerifiedSafe = Find-SafeByName -TenantUrl $TenantUrl -SafeName $Change.SafeName -Headers $Headers
             $VerifiedManagingCPM = [string](Get-SafePropertyValue -Safe $VerifiedSafe -Names @("managingCPM", "ManagingCPM"))
             if (-not [string]::Equals($VerifiedManagingCPM, $Change.ManagingCPM, [StringComparison]::OrdinalIgnoreCase)) {
                 throw "Verification returned ManagingCPM '$VerifiedManagingCPM'."

@@ -188,13 +188,15 @@ Edit `ManagingCPM` to the new CPM name. Leave it blank to skip the safe, or use
 `NULL` or `<NONE>` to clear the safe's CPM assignment. The importer reads each
 safe's current settings, previews only actual changes, and requires typing
 `APPLY` before updating anything. It preserves the safe's description, OLAC
-setting, and retention setting.
+setting, and retention setting. During import, only safes listed in the CSV are
+requested through CyberArk's filtered safe search; the runner does not enumerate
+every safe in the tenant.
 
 Calls:
 
 ```text
 GET https://<subdomain>.privilegecloud.cyberark.cloud/PasswordVault/API/Safes
-GET https://<subdomain>.privilegecloud.cyberark.cloud/PasswordVault/API/Safes/<safeUrlId>
+GET https://<subdomain>.privilegecloud.cyberark.cloud/PasswordVault/API/Safes?search=<safeName>
 PUT https://<subdomain>.privilegecloud.cyberark.cloud/PasswordVault/API/Safes/<safeUrlId>
 ```
 

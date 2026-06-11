@@ -74,7 +74,9 @@ Only edit `ManagingCPM`:
 
 `CurrentManagingCPM` is informational. The importer re-reads the safe from the
 tenant before creating its update request, previews actual changes, and requires
-typing `APPLY`.
+typing `APPLY`. It retrieves only the safes named in the CSV, so a one-row import
+does not fetch the tenant's complete safe list. The exact safe and its
+`safeUrlId` are resolved with CyberArk's filtered safe search.
 
 ## PSM Users From Recordings Export
 

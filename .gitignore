@@ -1,5 +1,6 @@
 # Generated exports and imports can contain real tenant, safe, user, group, or permission data.
 *.csv
+.~lock.*#
 
 # PowerShell/editor/local artifacts
 *.log
