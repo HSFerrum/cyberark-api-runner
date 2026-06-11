@@ -188,9 +188,11 @@ Edit `ManagingCPM` to the new CPM name. Leave it blank to skip the safe, or use
 `NULL` or `<NONE>` to clear the safe's CPM assignment. The importer reads each
 safe's current settings, previews only actual changes, and requires typing
 `APPLY` before updating anything. It preserves the safe's description, OLAC
-setting, and retention setting. During import, only safes listed in the CSV are
-requested through CyberArk's filtered safe search; the runner does not enumerate
-every safe in the tenant.
+setting, and retention setting. The importer first compares `ManagingCPM` with
+`CurrentManagingCPM` inside the CSV and contacts CyberArk only for edited rows.
+For example, changing one row in a 2,800-safe export results in one safe lookup,
+not 2,800 lookups. The CSV preview and `APPLY` confirmation occur before those
+API calls; afterward, each edited safe is read, updated, and verified immediately.
 
 Calls:
 

@@ -72,11 +72,12 @@ Only edit `ManagingCPM`:
 - Leave it blank to make no change.
 - Set it to `NULL` or `<NONE>` to clear the CPM assignment.
 
-`CurrentManagingCPM` is informational. The importer re-reads the safe from the
-tenant before creating its update request, previews actual changes, and requires
-typing `APPLY`. It retrieves only the safes named in the CSV, so a one-row import
-does not fetch the tenant's complete safe list. The exact safe and its
-`safeUrlId` are resolved with CyberArk's filtered safe search.
+`CurrentManagingCPM` is the exported baseline and should not be edited. The
+importer compares it locally with `ManagingCPM`, then contacts CyberArk only for
+rows whose values differ. It re-reads those edited safes before creating update
+requests. The CSV preview and `APPLY` confirmation happen before API calls, then
+each edited safe is read, updated, and verified immediately. The exact safe and
+its `safeUrlId` are resolved with CyberArk's filtered safe search.
 
 ## PSM Users From Recordings Export
 

@@ -1771,11 +1771,15 @@ function Import-SafeCpmAssignments {
         "Content-Type"  = "application/json"
     }
 
-    Write-Host "Fetching current settings for the safes listed in the CSV..." -ForegroundColor Cyan
-    $Changes = @()
+    $HasCurrentManagingCpmColumn = $Rows[0].PSObject.Properties.Name -contains "CurrentManagingCPM"
+    if (-not $HasCurrentManagingCpmColumn) {
+        Write-Warning "CSV has no CurrentManagingCPM column. Every nonblank row must be checked against CyberArk."
+    }
+
     $Skipped = 0
     $Failed = 0
     $SeenSafes = @{}
+    $EditedRows = @()
 
     foreach ($Row in $Rows) {
         $SafeName = Get-RowValue -Row $Row -Names @("SafeName")
@@ -1797,43 +1801,32 @@ function Import-SafeCpmAssignments {
         }
         $SeenSafes[$SafeName] = $true
 
-        try {
-            $SafeDetails = Find-SafeByName -TenantUrl $TenantUrl -SafeName $SafeName -Headers $Headers
-            $SafeUrlId = [string](Get-SafePropertyValue -Safe $SafeDetails -Names @("safeUrlId", "SafeUrlId"))
-            if ([string]::IsNullOrWhiteSpace($SafeUrlId)) {
-                throw "Safe '$SafeName' did not contain a safeUrlId."
-            }
-            $CurrentManagingCPM = [string](Get-SafePropertyValue -Safe $SafeDetails -Names @("managingCPM", "ManagingCPM"))
-            if ([string]::Equals($CurrentManagingCPM, $DesiredManagingCPM, [StringComparison]::OrdinalIgnoreCase)) {
+        if ($HasCurrentManagingCpmColumn) {
+            $CsvCurrentManagingCPM = ([string]$Row.CurrentManagingCPM).Trim()
+            if ([string]::Equals($CsvCurrentManagingCPM, $DesiredManagingCPM, [StringComparison]::OrdinalIgnoreCase)) {
                 $Skipped++
                 continue
             }
-
-            $Changes += [PSCustomObject]@{
-                SafeName           = $SafeName
-                CurrentManagingCPM = $CurrentManagingCPM
-                ManagingCPM        = $DesiredManagingCPM
-                SafeUrlId          = $SafeUrlId
-                SafeDetails        = $SafeDetails
-            }
         }
-        catch {
-            Write-Warning "Failed to read current settings for $SafeName. $($_.Exception.Message)"
-            $Failed++
+
+        $EditedRows += [PSCustomObject]@{
+            SafeName           = $SafeName
+            CurrentManagingCPM = if ($HasCurrentManagingCpmColumn) { ([string]$Row.CurrentManagingCPM).Trim() } else { "<not provided>" }
+            ManagingCPM        = $DesiredManagingCPM
         }
     }
 
-    if ($Changes.Count -eq 0) {
-        Write-Host "No CPM assignment changes were found. Skipped: $Skipped; Failed: $Failed" -ForegroundColor Yellow
+    if ($EditedRows.Count -eq 0) {
+        Write-Host "No edited CPM assignments were found in the CSV. Skipped: $Skipped" -ForegroundColor Yellow
         return
     }
 
     Write-Host ""
-    Write-Host "Proposed safe CPM changes:" -ForegroundColor Yellow
-    $Changes |
+    Write-Host "Proposed safe CPM changes from the CSV:" -ForegroundColor Yellow
+    $EditedRows |
         Select-Object SafeName, CurrentManagingCPM, @{ Name = "NewManagingCPM"; Expression = { $_.ManagingCPM } } |
         Format-Table -AutoSize
-    Write-Warning "This will update $($Changes.Count) safe(s)."
+    Write-Warning "This will check and potentially update $($EditedRows.Count) safe(s)."
     $Confirmation = Read-Host "Type APPLY to continue"
     if ($Confirmation -cne "APPLY") {
         Write-Host "No changes were made." -ForegroundColor Yellow
@@ -1841,23 +1834,40 @@ function Import-SafeCpmAssignments {
     }
 
     $Updated = 0
-    foreach ($Change in $Changes) {
+    Write-Host "Applying edited rows without fetching unchanged safes..." -ForegroundColor Cyan
+    foreach ($EditedRow in $EditedRows) {
+        $SafeName = $EditedRow.SafeName
+        $DesiredManagingCPM = $EditedRow.ManagingCPM
+
         try {
-            $Body = New-SafeCpmUpdateBody -Safe $Change.SafeDetails -ManagingCPM $Change.ManagingCPM
-            $Uri = "$TenantUrl/API/Safes/$($Change.SafeUrlId)"
+            $SafeDetails = Find-SafeByName -TenantUrl $TenantUrl -SafeName $SafeName -Headers $Headers
+            $SafeUrlId = [string](Get-SafePropertyValue -Safe $SafeDetails -Names @("safeUrlId", "SafeUrlId"))
+            if ([string]::IsNullOrWhiteSpace($SafeUrlId)) {
+                throw "Safe '$SafeName' did not contain a safeUrlId."
+            }
+
+            $CurrentManagingCPM = [string](Get-SafePropertyValue -Safe $SafeDetails -Names @("managingCPM", "ManagingCPM"))
+            if ([string]::Equals($CurrentManagingCPM, $DesiredManagingCPM, [StringComparison]::OrdinalIgnoreCase)) {
+                Write-Host "Skipping $SafeName because it already uses '$DesiredManagingCPM'." -ForegroundColor Yellow
+                $Skipped++
+                continue
+            }
+
+            $Body = New-SafeCpmUpdateBody -Safe $SafeDetails -ManagingCPM $DesiredManagingCPM
+            $Uri = "$TenantUrl/API/Safes/$SafeUrlId"
             $null = Invoke-CyberArkJsonRequest -Method "PUT" -Uri $Uri -Headers $Headers -Body $Body
 
-            $VerifiedSafe = Find-SafeByName -TenantUrl $TenantUrl -SafeName $Change.SafeName -Headers $Headers
+            $VerifiedSafe = Find-SafeByName -TenantUrl $TenantUrl -SafeName $SafeName -Headers $Headers
             $VerifiedManagingCPM = [string](Get-SafePropertyValue -Safe $VerifiedSafe -Names @("managingCPM", "ManagingCPM"))
-            if (-not [string]::Equals($VerifiedManagingCPM, $Change.ManagingCPM, [StringComparison]::OrdinalIgnoreCase)) {
+            if (-not [string]::Equals($VerifiedManagingCPM, $DesiredManagingCPM, [StringComparison]::OrdinalIgnoreCase)) {
                 throw "Verification returned ManagingCPM '$VerifiedManagingCPM'."
             }
 
-            Write-Host "Updated $($Change.SafeName): '$($Change.CurrentManagingCPM)' -> '$($Change.ManagingCPM)'" -ForegroundColor Green
+            Write-Host "Updated $SafeName`: '$CurrentManagingCPM' -> '$DesiredManagingCPM'" -ForegroundColor Green
             $Updated++
         }
         catch {
-            Write-Warning "Failed to update $($Change.SafeName). $($_.Exception.Message)"
+            Write-Warning "Failed to update $SafeName. $($_.Exception.Message)"
             $Failed++
         }
     }
