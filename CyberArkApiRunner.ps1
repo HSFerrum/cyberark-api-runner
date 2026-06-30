@@ -1875,18 +1875,64 @@ function Export-SafeCpmAssignments {
             continue
         }
 
+        $SafeUrlId = [string](Get-SafePropertyValue -Safe $Safe -Names @("safeUrlId", "SafeUrlId"))
+        $OlacEnabled = Get-SafePropertyValue -Safe $Safe -Names @("olacEnabled", "OLACEnabled")
+        $VersionsRetention = Get-SafePropertyValue -Safe $Safe -Names @("numberOfVersionsRetention", "NumberOfVersionsRetention")
+        $DaysRetention = Get-SafePropertyValue -Safe $Safe -Names @("numberOfDaysRetention", "NumberOfDaysRetention")
+        $NeedsSafeDetails = [string]::IsNullOrWhiteSpace($SafeUrlId) -or
+            $null -eq $OlacEnabled -or
+            [string]::IsNullOrWhiteSpace([string]$OlacEnabled) -or
+            (
+                ($null -eq $VersionsRetention -or [string]::IsNullOrWhiteSpace([string]$VersionsRetention)) -and
+                ($null -eq $DaysRetention -or [string]::IsNullOrWhiteSpace([string]$DaysRetention))
+            )
+
+        if ($NeedsSafeDetails) {
+            try {
+                $SafeDetails = Find-SafeByName -TenantUrl $TenantUrl -SafeName $SafeName -Headers $Headers
+                $Safe = $SafeDetails
+                $SafeUrlId = [string](Get-SafePropertyValue -Safe $Safe -Names @("safeUrlId", "SafeUrlId"))
+                $OlacEnabled = Get-SafePropertyValue -Safe $Safe -Names @("olacEnabled", "OLACEnabled")
+                $VersionsRetention = Get-SafePropertyValue -Safe $Safe -Names @("numberOfVersionsRetention", "NumberOfVersionsRetention")
+                $DaysRetention = Get-SafePropertyValue -Safe $Safe -Names @("numberOfDaysRetention", "NumberOfDaysRetention")
+            }
+            catch {
+                Write-Warning "Skipping safe $SafeName because required update snapshot fields could not be fetched. $($_.Exception.Message)"
+                continue
+            }
+        }
+
+        if ([string]::IsNullOrWhiteSpace($SafeUrlId)) {
+            Write-Warning "Skipping safe $SafeName because it does not contain SafeUrlId."
+            continue
+        }
+        if ($null -eq $OlacEnabled -or [string]::IsNullOrWhiteSpace([string]$OlacEnabled)) {
+            Write-Warning "Skipping safe $SafeName because it does not contain OLACEnabled."
+            continue
+        }
+        if (($null -eq $VersionsRetention -or [string]::IsNullOrWhiteSpace([string]$VersionsRetention)) -and
+            ($null -eq $DaysRetention -or [string]::IsNullOrWhiteSpace([string]$DaysRetention))) {
+            Write-Warning "Skipping safe $SafeName because it does not contain a retention setting."
+            continue
+        }
+
         $CurrentManagingCPM = [string](Get-SafePropertyValue -Safe $Safe -Names @("managingCPM", "ManagingCPM"))
         $Rows += [PSCustomObject][ordered]@{
             CpmUpdateMode                = "DirectWrite"
             SafeName                     = $SafeName
-            SafeUrlId                    = [string](Get-SafePropertyValue -Safe $Safe -Names @("safeUrlId", "SafeUrlId"))
+            SafeUrlId                    = $SafeUrlId
             CurrentManagingCPM           = $CurrentManagingCPM
             ManagingCPM                  = $CurrentManagingCPM
             Description                  = [string](Get-SafePropertyValue -Safe $Safe -Names @("description", "Description"))
-            OLACEnabled                  = Get-SafePropertyValue -Safe $Safe -Names @("olacEnabled", "OLACEnabled")
-            NumberOfVersionsRetention    = Get-SafePropertyValue -Safe $Safe -Names @("numberOfVersionsRetention", "NumberOfVersionsRetention")
-            NumberOfDaysRetention        = Get-SafePropertyValue -Safe $Safe -Names @("numberOfDaysRetention", "NumberOfDaysRetention")
+            OLACEnabled                  = $OlacEnabled
+            NumberOfVersionsRetention    = $VersionsRetention
+            NumberOfDaysRetention        = $DaysRetention
         }
+    }
+
+    if ($Rows.Count -eq 0) {
+        Write-Warning "No safes with complete update snapshot data were found."
+        return
     }
 
     $Rows |
@@ -1937,7 +1983,8 @@ function Import-SafeCpmAssignments {
         "NumberOfVersionsRetention",
         "NumberOfDaysRetention"
     )
-    $HasDirectWriteColumns = ($DirectWriteColumns | Where-Object { $Rows[0].PSObject.Properties.Name -notcontains $_ }).Count -eq 0
+    $MissingDirectWriteColumns = @($DirectWriteColumns | Where-Object { $Rows[0].PSObject.Properties.Name -notcontains $_ })
+    $HasDirectWriteColumns = $MissingDirectWriteColumns.Count -eq 0
     $CanDirectWrite = $HasDirectWriteColumns -and
         $Rows[0].PSObject.Properties.Name -contains "CpmUpdateMode" -and
         [string]::Equals(([string]$Rows[0].CpmUpdateMode).Trim(), "DirectWrite", [StringComparison]::OrdinalIgnoreCase)
@@ -1949,6 +1996,11 @@ function Import-SafeCpmAssignments {
         Write-Warning "Edit only ManagingCPM. Use a recent export to avoid overwriting newer safe settings."
     }
     else {
+        if ($Rows[0].PSObject.Properties.Name -contains "CpmUpdateMode" -and
+            [string]::Equals(([string]$Rows[0].CpmUpdateMode).Trim(), "DirectWrite", [StringComparison]::OrdinalIgnoreCase) -and
+            $MissingDirectWriteColumns.Count -gt 0) {
+            Write-Warning "Direct-write CSV is missing required column(s): $($MissingDirectWriteColumns -join ', '). Falling back to legacy mode."
+        }
         Write-Warning "Legacy CSV detected. Each changed safe requires lookup and verification requests."
     }
 
