@@ -327,7 +327,7 @@ function Show-LoginDialog {
             }
         }
     }
-    if ($Controls.Authentication.Items.Contains($DesiredAuth)) {
+    if (-not [string]::IsNullOrWhiteSpace($DesiredAuth) -and $Controls.Authentication.Items.Contains($DesiredAuth)) {
         $Controls.Authentication.SelectedItem = $DesiredAuth
     }
     & $UpdateAuthFields

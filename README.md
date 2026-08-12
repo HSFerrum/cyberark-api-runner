@@ -28,6 +28,13 @@ On this Linux machine, PowerShell is available as `pwsh`.
 pwsh ./CyberArkApiRunner.ps1
 ```
 
+If Windows PowerShell reports that script execution is disabled, either install
+and use PowerShell 7 as required above or use a process-only policy override:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\CyberArkApiRunner.ps1
+```
+
 On Windows, the runner opens a sign-in form by default. For dropdown choices,
 type the first letter and press Tab to select the option and advance. The form
 also supports Tab and Shift+Tab navigation and Ctrl+V paste. Passwords, client
