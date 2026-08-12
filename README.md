@@ -28,6 +28,19 @@ On this Linux machine, PowerShell is available as `pwsh`.
 pwsh ./CyberArkApiRunner.ps1
 ```
 
+On Windows, the runner opens a sign-in form by default. For dropdown choices,
+type the first letter and press Tab to select the option and advance. The form
+also supports Tab and Shift+Tab navigation and Ctrl+V paste. Passwords, client
+secrets, and OTP values stay masked. To use terminal prompts instead (for
+example, in a remote console), launch with `-ConsoleLogin`:
+
+```bash
+pwsh ./CyberArkApiRunner.ps1 -ConsoleLogin
+```
+
+Console choices use arrow keys and highlighted single-letter shortcuts, so you
+do not need to type values such as `privilegecloud` or `interactive` in full.
+
 To launch directly into on-prem mode:
 
 ```bash

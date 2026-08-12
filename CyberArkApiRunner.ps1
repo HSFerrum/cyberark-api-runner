@@ -54,11 +54,376 @@ param (
     [string]$OnPremAuthType,
 
     [Parameter(Mandatory = $false)]
-    [int]$PsmLookbackDays = 90
+    [int]$PsmLookbackDays = 90,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$ConsoleLogin
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+$script:OriginalBoundParameters = @{} + $PSBoundParameters
+
+function Restart-InStaForGraphicalLogin {
+    if (
+        -not (Test-GraphicalLoginAvailable) -or
+        -not [string]::IsNullOrWhiteSpace($script:Token) -or
+        [Threading.Thread]::CurrentThread.ApartmentState -eq [Threading.ApartmentState]::STA -or
+        [string]::IsNullOrWhiteSpace($PSCommandPath)
+    ) {
+        return $false
+    }
+
+    $PowerShellPath = (Get-Process -Id $PID).Path
+    $Arguments = @("-NoProfile", "-STA", "-File", $PSCommandPath)
+    foreach ($Entry in $script:OriginalBoundParameters.GetEnumerator()) {
+        if ($Entry.Value -is [System.Management.Automation.SwitchParameter]) {
+            if ($Entry.Value.IsPresent) {
+                $Arguments += "-$($Entry.Key)"
+            }
+            continue
+        }
+        $Arguments += "-$($Entry.Key)"
+        $Arguments += [string]$Entry.Value
+    }
+
+    & $PowerShellPath @Arguments
+    $script:StaChildExitCode = $LASTEXITCODE
+    return $true
+}
+
+function Test-GraphicalLoginAvailable {
+    return (
+        -not $script:ConsoleLogin -and
+        $env:OS -eq "Windows_NT" -and
+        [Environment]::UserInteractive
+    )
+}
+
+function ConvertTo-SecureStringFromPlainText {
+    param (
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string]$Value
+    )
+
+    return ConvertTo-SecureString -String $Value -AsPlainText -Force
+}
+
+function Show-SecretPromptDialog {
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$Prompt
+    )
+
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+
+    $Form = New-Object System.Windows.Forms.Form
+    $Form.Text = "CyberArk API Runner"
+    $Form.ClientSize = New-Object System.Drawing.Size(460, 142)
+    $Form.StartPosition = "CenterScreen"
+    $Form.FormBorderStyle = "FixedDialog"
+    $Form.MaximizeBox = $false
+    $Form.MinimizeBox = $false
+    $Form.ShowInTaskbar = $true
+    $Form.TopMost = $true
+
+    $Label = New-Object System.Windows.Forms.Label
+    $Label.Text = $Prompt
+    $Label.AutoSize = $true
+    $Label.Location = New-Object System.Drawing.Point(16, 16)
+    $Form.Controls.Add($Label)
+
+    $SecretBox = New-Object System.Windows.Forms.TextBox
+    $SecretBox.Location = New-Object System.Drawing.Point(19, 42)
+    $SecretBox.Size = New-Object System.Drawing.Size(420, 25)
+    $SecretBox.UseSystemPasswordChar = $true
+    $SecretBox.TabIndex = 0
+    $Form.Controls.Add($SecretBox)
+
+    $PasteHint = New-Object System.Windows.Forms.Label
+    $PasteHint.Text = "Ctrl+V pastes. The value remains masked."
+    $PasteHint.AutoSize = $true
+    $PasteHint.ForeColor = [System.Drawing.Color]::DimGray
+    $PasteHint.Location = New-Object System.Drawing.Point(16, 72)
+    $Form.Controls.Add($PasteHint)
+
+    $OkButton = New-Object System.Windows.Forms.Button
+    $OkButton.Text = "OK"
+    $OkButton.Location = New-Object System.Drawing.Point(283, 103)
+    $OkButton.Size = New-Object System.Drawing.Size(75, 28)
+    $OkButton.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    $OkButton.TabIndex = 1
+    $Form.Controls.Add($OkButton)
+
+    $CancelButton = New-Object System.Windows.Forms.Button
+    $CancelButton.Text = "Cancel"
+    $CancelButton.Location = New-Object System.Drawing.Point(364, 103)
+    $CancelButton.Size = New-Object System.Drawing.Size(75, 28)
+    $CancelButton.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $CancelButton.TabIndex = 2
+    $Form.Controls.Add($CancelButton)
+
+    $Form.AcceptButton = $OkButton
+    $Form.CancelButton = $CancelButton
+    $Form.Add_Shown({ $SecretBox.Focus() })
+
+    try {
+        $DialogResult = $Form.ShowDialog()
+        if ($DialogResult -ne [System.Windows.Forms.DialogResult]::OK) {
+            throw "Sign-in canceled."
+        }
+        return ConvertTo-SecureStringFromPlainText -Value $SecretBox.Text
+    }
+    finally {
+        $SecretBox.Clear()
+        $Form.Dispose()
+    }
+}
+
+function Read-SecureValue {
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$Prompt
+    )
+
+    if (Test-GraphicalLoginAvailable) {
+        return Show-SecretPromptDialog -Prompt $Prompt
+    }
+    return Read-Host $Prompt -AsSecureString
+}
+
+function Show-LoginDialog {
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+
+    $Form = New-Object System.Windows.Forms.Form
+    $Form.Text = "CyberArk API Runner - Sign in"
+    $Form.ClientSize = New-Object System.Drawing.Size(620, 485)
+    $Form.StartPosition = "CenterScreen"
+    $Form.FormBorderStyle = "FixedDialog"
+    $Form.MaximizeBox = $false
+    $Form.MinimizeBox = $false
+    $Form.ShowInTaskbar = $true
+
+    $Title = New-Object System.Windows.Forms.Label
+    $Title.Text = "Sign in to CyberArk"
+    $Title.Font = New-Object System.Drawing.Font($Form.Font.FontFamily, 15, [System.Drawing.FontStyle]::Bold)
+    $Title.AutoSize = $true
+    $Title.Location = New-Object System.Drawing.Point(24, 20)
+    $Form.Controls.Add($Title)
+
+    $Hint = New-Object System.Windows.Forms.Label
+    $Hint.Text = "For choices, type the first letter and press Tab. Ctrl+V pastes into any field."
+    $Hint.AutoSize = $true
+    $Hint.ForeColor = [System.Drawing.Color]::DimGray
+    $Hint.Location = New-Object System.Drawing.Point(27, 53)
+    $Form.Controls.Add($Hint)
+
+    $Labels = @{}
+    $Controls = @{}
+    $RowNames = @("Environment", "Authentication", "Endpoint", "IdentityHost", "ApplicationId", "Login", "Password", "Otp")
+    $RowLabels = @{
+        Environment = "Environment"
+        Authentication = "Authentication"
+        Endpoint = "Tenant subdomain"
+        IdentityHost = "Identity host (optional)"
+        ApplicationId = "OAuth application ID"
+        Login = "Client ID / login name"
+        Password = "Client secret / password"
+        Otp = "RADIUS OTP (optional)"
+    }
+
+    for ($Index = 0; $Index -lt $RowNames.Count; $Index++) {
+        $Name = $RowNames[$Index]
+        $Y = 91 + ($Index * 42)
+
+        $Label = New-Object System.Windows.Forms.Label
+        $Label.Text = $RowLabels[$Name]
+        $Label.AutoSize = $true
+        $Label.Location = New-Object System.Drawing.Point(28, ($Y + 5))
+        $Labels[$Name] = $Label
+        $Form.Controls.Add($Label)
+
+        if ($Name -in @("Environment", "Authentication")) {
+            $Control = New-Object System.Windows.Forms.ComboBox
+            $Control.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
+            $Control.AutoCompleteSource = [System.Windows.Forms.AutoCompleteSource]::ListItems
+            $Control.AutoCompleteMode = [System.Windows.Forms.AutoCompleteMode]::Append
+        }
+        else {
+            $Control = New-Object System.Windows.Forms.TextBox
+        }
+        $Control.Location = New-Object System.Drawing.Point(220, $Y)
+        $Control.Size = New-Object System.Drawing.Size(365, 26)
+        $Control.TabIndex = $Index
+        $Controls[$Name] = $Control
+        $Form.Controls.Add($Control)
+    }
+
+    $Controls.Password.UseSystemPasswordChar = $true
+    $Controls.Otp.UseSystemPasswordChar = $true
+    [void]$Controls.Environment.Items.AddRange(@("Privilege Cloud", "On-prem"))
+
+    $UpdateFields = {
+        $IsPrivilegeCloud = $Controls.Environment.SelectedItem -eq "Privilege Cloud"
+        $PreviousAuth = [string]$Controls.Authentication.SelectedItem
+        $Controls.Authentication.Items.Clear()
+        if ($IsPrivilegeCloud) {
+            [void]$Controls.Authentication.Items.AddRange(@("OAuth", "Interactive"))
+            $Labels.Endpoint.Text = "Tenant subdomain"
+            $Controls.Endpoint.Text = $script:Subdomain
+            $Controls.IdentityHost.Enabled = $true
+            $Labels.Login.Text = if ($PreviousAuth -eq "Interactive") { "Username" } else { "Client ID / login name" }
+        }
+        else {
+            [void]$Controls.Authentication.Items.AddRange(@("CyberArk", "LDAP", "RADIUS"))
+            $Labels.Endpoint.Text = "PVWA URL"
+            $Controls.Endpoint.Text = $script:PVWAUrl
+            $Controls.IdentityHost.Enabled = $false
+            $Labels.Login.Text = "Vault username"
+        }
+        if ($Controls.Authentication.Items.Contains($PreviousAuth)) {
+            $Controls.Authentication.SelectedItem = $PreviousAuth
+        }
+        else {
+            $Controls.Authentication.SelectedIndex = 0
+        }
+    }
+
+    $UpdateAuthFields = {
+        $IsPrivilegeCloud = $Controls.Environment.SelectedItem -eq "Privilege Cloud"
+        $IsOAuth = $IsPrivilegeCloud -and $Controls.Authentication.SelectedItem -eq "OAuth"
+        $IsRadius = -not $IsPrivilegeCloud -and $Controls.Authentication.SelectedItem -eq "RADIUS"
+        $Controls.ApplicationId.Enabled = $IsOAuth
+        $Controls.Otp.Enabled = $IsRadius
+        $Labels.Login.Text = if ($IsPrivilegeCloud -and -not $IsOAuth) { "Username" } elseif ($IsPrivilegeCloud) { "Client ID / login name" } else { "Vault username" }
+        $Labels.Password.Text = if ($IsOAuth) { "Client secret / password" } else { "Password" }
+    }
+
+    $Controls.Environment.Add_SelectedIndexChanged($UpdateFields)
+    $Controls.Authentication.Add_SelectedIndexChanged($UpdateAuthFields)
+
+    $Controls.Environment.SelectedItem = if ($script:EnvironmentType -eq "onprem") { "On-prem" } else { "Privilege Cloud" }
+    $Controls.IdentityHost.Text = $script:IdentityHost
+    $Controls.ApplicationId.Text = $script:ApplicationId
+    $Controls.Login.Text = if (-not [string]::IsNullOrWhiteSpace($script:ClientId)) { $script:ClientId } else { $script:Username }
+
+    $DesiredAuth = switch ($script:EnvironmentType) {
+        "onprem" {
+            switch ($script:OnPremAuthType) {
+                "cyberark" { "CyberArk" }
+                "ldap" { "LDAP" }
+                "radius" { "RADIUS" }
+                default { $null }
+            }
+        }
+        default {
+            switch ($script:AuthType) {
+                "oauth" { "OAuth" }
+                "interactive" { "Interactive" }
+                default { $null }
+            }
+        }
+    }
+    if ($Controls.Authentication.Items.Contains($DesiredAuth)) {
+        $Controls.Authentication.SelectedItem = $DesiredAuth
+    }
+    & $UpdateAuthFields
+
+    $OkButton = New-Object System.Windows.Forms.Button
+    $OkButton.Text = "Sign in"
+    $OkButton.Location = New-Object System.Drawing.Point(414, 438)
+    $OkButton.Size = New-Object System.Drawing.Size(82, 30)
+    $OkButton.TabIndex = 8
+    $Form.Controls.Add($OkButton)
+
+    $CancelButton = New-Object System.Windows.Forms.Button
+    $CancelButton.Text = "Cancel"
+    $CancelButton.Location = New-Object System.Drawing.Point(503, 438)
+    $CancelButton.Size = New-Object System.Drawing.Size(82, 30)
+    $CancelButton.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $CancelButton.TabIndex = 9
+    $Form.Controls.Add($CancelButton)
+    $Form.AcceptButton = $OkButton
+    $Form.CancelButton = $CancelButton
+
+    $OkButton.Add_Click({
+        $IsPrivilegeCloud = $Controls.Environment.SelectedItem -eq "Privilege Cloud"
+        $IsOAuth = $IsPrivilegeCloud -and $Controls.Authentication.SelectedItem -eq "OAuth"
+        $Missing = @()
+        if ([string]::IsNullOrWhiteSpace($Controls.Endpoint.Text)) { $Missing += $Labels.Endpoint.Text }
+        if ([string]::IsNullOrWhiteSpace($Controls.Login.Text)) { $Missing += $Labels.Login.Text }
+        if ([string]::IsNullOrWhiteSpace($Controls.Password.Text)) { $Missing += $Labels.Password.Text }
+        if ($IsOAuth -and [string]::IsNullOrWhiteSpace($Controls.ApplicationId.Text)) { $Missing += $Labels.ApplicationId.Text }
+        if ($Missing.Count -gt 0) {
+            [void][System.Windows.Forms.MessageBox]::Show(
+                "Enter: $($Missing -join ', ')",
+                "Missing sign-in information",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Warning
+            )
+            return
+        }
+        $Form.DialogResult = [System.Windows.Forms.DialogResult]::OK
+        $Form.Close()
+    })
+
+    $Form.Add_Shown({ $Controls.Environment.Focus() })
+    try {
+        $DialogResult = $Form.ShowDialog()
+        if ($DialogResult -ne [System.Windows.Forms.DialogResult]::OK) {
+            throw "Sign-in canceled."
+        }
+
+        return [pscustomobject]@{
+            EnvironmentType = if ($Controls.Environment.SelectedItem -eq "On-prem") { "onprem" } else { "privilegecloud" }
+            AuthType = ([string]$Controls.Authentication.SelectedItem).ToLowerInvariant()
+            Endpoint = $Controls.Endpoint.Text.Trim()
+            IdentityHost = $Controls.IdentityHost.Text.Trim()
+            ApplicationId = $Controls.ApplicationId.Text.Trim()
+            Login = $Controls.Login.Text.Trim()
+            Password = ConvertTo-SecureStringFromPlainText -Value $Controls.Password.Text
+            Otp = $Controls.Otp.Text.Trim()
+        }
+    }
+    finally {
+        $Controls.Password.Clear()
+        $Controls.Otp.Clear()
+        $Form.Dispose()
+    }
+}
+
+function Initialize-LoginExperience {
+    if (-not (Test-GraphicalLoginAvailable) -or -not [string]::IsNullOrWhiteSpace($script:Token)) {
+        return
+    }
+
+    $Login = Show-LoginDialog
+    $script:EnvironmentType = $Login.EnvironmentType
+    if ($Login.EnvironmentType -eq "onprem") {
+        $script:PVWAUrl = $Login.Endpoint
+        $script:OnPremAuthType = $Login.AuthType
+        $script:Username = $Login.Login
+        $script:OnPremPassword = $Login.Password
+        $script:RadiusOtp = $Login.Otp
+    }
+    else {
+        $script:Subdomain = $Login.Endpoint
+        $script:AuthType = $Login.AuthType
+        $script:IdentityHost = $Login.IdentityHost
+        if ($Login.AuthType -eq "oauth") {
+            $script:ApplicationId = $Login.ApplicationId
+            $script:ClientId = $Login.Login
+            $script:OAuthClientSecret = $Login.Password
+        }
+        else {
+            $script:Username = $Login.Login
+            $script:InteractivePassword = $Login.Password
+        }
+    }
+}
 
 function Read-RequiredValue {
     param (
@@ -85,7 +450,7 @@ function Read-Token {
         return Format-AuthorizationToken -Token $ExistingToken
     }
 
-    $SecureToken = Read-Host "Platform token" -AsSecureString
+    $SecureToken = Read-SecureValue -Prompt "Platform token"
     $PlainToken = ConvertFrom-SecureStringToPlainText -SecureString $SecureToken
     return Format-AuthorizationToken -Token $PlainToken
 }
@@ -99,13 +464,46 @@ function Read-Choice {
         [string[]]$Choices
     )
 
-    $ChoiceText = $Choices -join "/"
+    $DisplayNames = @{
+        privilegecloud = "Privilege Cloud"
+        onprem = "On-prem"
+        oauth = "OAuth"
+        interactive = "Interactive"
+        cyberark = "CyberArk"
+        ldap = "LDAP"
+        radius = "RADIUS"
+    }
+
+    $ChoiceDescriptions = @()
+    foreach ($Choice in $Choices) {
+        $DisplayName = if ($DisplayNames.ContainsKey($Choice)) { $DisplayNames[$Choice] } else { $Choice }
+        $ChoiceDescriptions += New-Object System.Management.Automation.Host.ChoiceDescription(
+            "&$DisplayName",
+            "Select $DisplayName"
+        )
+    }
+
+    try {
+        $SelectedIndex = $Host.UI.PromptForChoice(
+            $Prompt,
+            "Use the arrow keys, or press the highlighted first letter.",
+            [System.Management.Automation.Host.ChoiceDescription[]]$ChoiceDescriptions,
+            0
+        )
+        return $Choices[$SelectedIndex]
+    }
+    catch {
+        # Some redirected and non-interactive hosts do not implement PromptForChoice.
+    }
+
+    $ChoiceText = ($Choices | ForEach-Object { $DisplayNames[$_] }) -join "/"
     while ($true) {
         $Value = (Read-Host "$Prompt ($ChoiceText)").Trim().ToLowerInvariant()
-        if ($Choices -contains $Value) {
-            return $Value
+        $Matches = @($Choices | Where-Object { $_.StartsWith($Value, [StringComparison]::OrdinalIgnoreCase) })
+        if (-not [string]::IsNullOrWhiteSpace($Value) -and $Matches.Count -eq 1) {
+            return $Matches[0]
         }
-        Write-Host "Choose one of: $ChoiceText" -ForegroundColor Yellow
+        Write-Host "Choose one of: $ChoiceText. A unique first letter is enough." -ForegroundColor Yellow
     }
 }
 
@@ -378,7 +776,7 @@ function Get-OAuthPlatformToken {
     )
 
     if ($null -eq $ClientSecret) {
-        $ClientSecret = Read-Host "OAuth client secret / password" -AsSecureString
+        $ClientSecret = Read-SecureValue -Prompt "OAuth client secret / password"
     }
     $script:OAuthClientSecret = $ClientSecret
     $PlainClientSecret = ConvertFrom-SecureStringToPlainText -SecureString $ClientSecret
@@ -643,7 +1041,7 @@ function Complete-InteractiveChallenge {
         }
 
         if ($Action.ToLowerInvariant() -eq "answer") {
-            $Body["Answer"] = ConvertFrom-SecureStringToPlainText -SecureString (Read-Host "Challenge answer / OTP" -AsSecureString)
+            $Body["Answer"] = ConvertFrom-SecureStringToPlainText -SecureString (Read-SecureValue -Prompt "Challenge answer / OTP")
         }
 
         $Response = Invoke-JsonPost -Uri $AdvanceUrl -Headers $Headers -Body $Body
@@ -683,7 +1081,7 @@ function Get-InteractivePlatformToken {
     )
 
     if ($null -eq $Password) {
-        $Password = Read-Host "Interactive password" -AsSecureString
+        $Password = Read-SecureValue -Prompt "Interactive password"
     }
     $script:InteractivePassword = $Password
     $PlainPassword = ConvertFrom-SecureStringToPlainText -SecureString $Password
@@ -757,9 +1155,16 @@ function Get-OnPremSessionToken {
         $script:Username = Read-RequiredValue -Prompt "Vault username"
     }
 
-    $Password = ConvertFrom-SecureStringToPlainText -SecureString (Read-Host "Vault password" -AsSecureString)
+    $CachedOnPremPassword = Get-Variable -Name "OnPremPassword" -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+    if ($null -eq $CachedOnPremPassword) {
+        $CachedOnPremPassword = Read-SecureValue -Prompt "Vault password"
+    }
+    $Password = ConvertFrom-SecureStringToPlainText -SecureString $CachedOnPremPassword
     if ($script:OnPremAuthType -eq "radius") {
-        $Otp = Read-Host "RADIUS OTP (leave blank if appended by your password workflow)"
+        $Otp = Get-Variable -Name "RadiusOtp" -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+        if ($null -eq $Otp) {
+            $Otp = Read-Host "RADIUS OTP (leave blank if appended by your password workflow)"
+        }
         if (-not [string]::IsNullOrWhiteSpace($Otp)) {
             $Password = "$Password,$($Otp.Trim())"
         }
@@ -822,13 +1227,15 @@ function Get-PlatformToken {
         if ([string]::IsNullOrWhiteSpace($script:ClientId)) {
             $script:ClientId = Read-RequiredValue -Prompt "OAuth client ID / login name"
         }
-        return Get-OAuthPlatformToken -IdentityHost $script:IdentityHost -ApplicationId $script:ApplicationId -ClientId $script:ClientId
+        $CachedClientSecret = Get-Variable -Name "OAuthClientSecret" -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+        return Get-OAuthPlatformToken -IdentityHost $script:IdentityHost -ApplicationId $script:ApplicationId -ClientId $script:ClientId -ClientSecret $CachedClientSecret
     }
 
     if ([string]::IsNullOrWhiteSpace($script:Username)) {
         $script:Username = Read-RequiredValue -Prompt "Interactive username"
     }
-    return Get-InteractivePlatformToken -Subdomain $Subdomain -IdentityHost $script:IdentityHost -Username $script:Username
+    $CachedInteractivePassword = Get-Variable -Name "InteractivePassword" -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+    return Get-InteractivePlatformToken -Subdomain $Subdomain -IdentityHost $script:IdentityHost -Username $script:Username -Password $CachedInteractivePassword
 }
 
 function Renew-PrivilegeCloudToken {
@@ -2341,6 +2748,8 @@ function Export-PMTerminalPlatformAudit {
 }
 
 function Start-CyberArkApiRunner {
+    Initialize-LoginExperience
+
     if ([string]::IsNullOrWhiteSpace($script:EnvironmentType)) {
         $script:EnvironmentType = Read-Choice -Prompt "CyberArk environment" -Choices @("privilegecloud", "onprem")
     }
@@ -2431,6 +2840,10 @@ function Start-CyberArkApiRunner {
             }
         }
     }
+}
+
+if (Restart-InStaForGraphicalLogin) {
+    exit $script:StaChildExitCode
 }
 
 try {
